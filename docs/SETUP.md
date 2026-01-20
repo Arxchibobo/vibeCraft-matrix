@@ -303,7 +303,7 @@ For contributing or modifying:
 
 ```bash
 # Clone
-git clone https://github.com/nearcyan/vibecraft
+git clone https://github.com/Arxchibobo/vibeCraft-matrix
 cd vibecraft
 
 # Install dependencies
@@ -346,6 +346,6 @@ rm -rf ~/.vibecraft
 
 ## Getting Help
 
-- **GitHub Issues:** https://github.com/nearcyan/vibecraft/issues
+- **GitHub Issues:** https://github.com/Arxchibobo/vibeCraft-matrix/issues
 - **Technical Docs:** See [CLAUDE.md](../CLAUDE.md)
 - **Orchestration:** See [ORCHESTRATION.md](./ORCHESTRATION.md)
