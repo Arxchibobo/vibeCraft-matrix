@@ -4,7 +4,9 @@
 
 **A Windows-compatible fork of [Vibecraft](https://github.com/Nearcyan/vibecraft)** — visualize Claude Code's activity in real-time as a 3D workshop.
 
-> This fork adds Windows support with Git Bash compatibility. All credit for the original project goes to [@Nearcyan](https://github.com/Nearcyan).
+> This fork adds Windows support with Git Bash compatibility, automatic Claude window launching, and multi-project session management. All credit for the original project goes to [@Nearcyan](https://github.com/Nearcyan).
+
+**Maintained by:** [@Arxchibobo](https://github.com/Arxchibobo)
 
 ![Three.js](https://img.shields.io/badge/Three.js-black?logo=threedotjs) ![TypeScript](https://img.shields.io/badge/TypeScript-blue?logo=typescript&logoColor=white) ![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
 

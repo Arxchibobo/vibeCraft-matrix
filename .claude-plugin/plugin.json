@@ -2,7 +2,7 @@
   "name": "vibecraft",
   "version": "0.1.0",
   "description": "3D visualization of Claude Code activity as an interactive workshop",
-  "author": "nearcyan",
+  "author": "Arxchibobo",
   "license": "MIT",
   "keywords": ["visualization", "3d", "vibecoding", "workshop", "monitoring"]
 }
