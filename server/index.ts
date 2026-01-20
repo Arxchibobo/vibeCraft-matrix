@@ -238,13 +238,264 @@ function collectRequestBody(req: IncomingMessage, maxSize: number = MAX_BODY_SIZ
 }
 
 /**
+ * 根据项目路径生成 Claude 窗口标题
+ * 格式: "Claude - 项目名"
+ *
+ * @param cwd - 项目工作目录
+ * @returns 窗口标题字符串
+ */
+function getProjectWindowTitle(cwd: string): string {
+  const projectName = cwd.split(/[/\\]/).filter(Boolean).pop() || 'Unknown'
+  return `Claude - ${projectName}`
+}
+
+/**
+ * 启动新的 Claude 窗口（使用 Windows Terminal）
+ * 自动设置窗口标题为 "Claude - 项目名"
+ *
+ * @param cwd - 项目工作目录
+ * @param claudeArgs - Claude CLI 参数
+ * @returns Promise<{success: boolean; windowTitle?: string; error?: string}>
+ */
+async function launchClaudeWindow(cwd: string, claudeArgs: string[]): Promise<{
+  success: boolean
+  windowTitle?: string
+  error?: string
+}> {
+  const windowTitle = getProjectWindowTitle(cwd)
+  const projectName = cwd.split(/[/\\]/).filter(Boolean).pop() || 'Unknown'
+
+  return new Promise((resolve) => {
+    // 构建 Claude 命令
+    // 默认添加 -c 参数尝试继续之前的对话（如果没有历史对话，Claude 会自动开始新对话）
+    const allArgs = ['-c', ...claudeArgs]
+    const claudeCmd = `claude ${allArgs.join(' ')}`
+
+    // 安全转义路径和参数（PowerShell 单引号字符串中，单引号需要用两个单引号转义）
+    const escapedCwd = cwd.replace(/\\/g, '\\\\').replace(/'/g, "''")
+    const escapedWindowTitle = windowTitle.replace(/'/g, "''")
+    const escapedClaudeCmd = claudeCmd.replace(/'/g, "''")
+    const escapedProjectName = projectName.replace(/'/g, "''")
+
+    // 使用 Windows Terminal 启动新窗口
+    // wt.exe 参数说明:
+    // -w 0: 在新窗口中打开（而非新标签页）
+    // nt: new-tab 命令
+    // -d: 指定工作目录
+    // --title: 设置窗口/标签页标题
+    // cmd /k: 运行命令后保持窗口打开
+    log(`[launchClaudeWindow] 启动 Windows Terminal: cwd=${cwd}, title=${windowTitle}`)
+
+    // 使用 PowerShell 的 Start-Process 启动 Windows Terminal
+    const psScript = `
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+try {
+    # 启动 Windows Terminal
+    Start-Process "wt.exe" -ArgumentList @('-w', '0', 'nt', '-d', '${escapedCwd}', '--title', '${escapedWindowTitle}', 'cmd', '/k', '${escapedClaudeCmd}')
+
+    # 等待窗口启动
+    Start-Sleep -Milliseconds 2000
+
+    # 验证窗口是否已启动（查找包含项目名的终端窗口）
+    $maxAttempts = 10
+    $attempt = 0
+    $found = $false
+
+    while ($attempt -lt $maxAttempts -and -not $found) {
+        $attempt++
+        Start-Sleep -Milliseconds 500
+
+        $windows = Get-Process | Where-Object {
+            ($_.ProcessName -eq "WindowsTerminal" -or $_.ProcessName -eq "cmd") -and
+            $_.MainWindowHandle -ne 0 -and
+            ($_.MainWindowTitle -like "*${escapedProjectName}*" -or
+             $_.MainWindowTitle -like "*claude*" -or
+             $_.MainWindowTitle -like "*Claude*")
+        }
+
+        if ($windows) {
+            $found = $true
+            $actualTitle = $windows[0].MainWindowTitle
+            Write-Output "SUCCESS|$actualTitle"
+        }
+    }
+
+    if (-not $found) {
+        # 即使没找到精确匹配，也认为启动成功（Claude 可能修改了窗口标题）
+        Write-Output "SUCCESS|${escapedWindowTitle}"
+    }
+} catch {
+    Write-Output "ERROR|$($_.Exception.Message)"
+}
+`
+
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', psScript],
+      { ...EXEC_OPTIONS, timeout: 20000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          log(`[launchClaudeWindow] PowerShell 错误: ${stderr || error.message}`)
+          resolve({ success: false, error: stderr || error.message })
+          return
+        }
+
+        const output = stdout.trim()
+        if (output.startsWith('SUCCESS|')) {
+          const actualTitle = output.split('|')[1] || windowTitle
+          log(`[launchClaudeWindow] 成功启动 Claude 窗口: ${actualTitle}`)
+          resolve({ success: true, windowTitle: actualTitle })
+        } else if (output.startsWith('ERROR|')) {
+          const errorMsg = output.split('|')[1] || '未知错误'
+          log(`[launchClaudeWindow] 启动失败: ${errorMsg}`)
+          resolve({ success: false, error: errorMsg })
+        } else {
+          // 假设启动成功
+          log(`[launchClaudeWindow] 启动完成（无明确状态）: ${output}`)
+          resolve({ success: true, windowTitle })
+        }
+      }
+    )
+  })
+}
+
+/**
+ * 检测是否存在 Claude 窗口（单主窗口模式）
+ * 用于 createSession() 检测已有的 Claude 实例
+ *
+ * 检测策略（按优先级）：
+ * 1. 精确匹配: 标题为 "Claude - 项目名"（如果提供 projectName）
+ * 2. 标题包含 "claude" / "Claude" / "CLAUDE"
+ * 3. 标题包含 "✳" 符号（Claude Code 特有的任务标识符）
+ * 4. 如果只有一个 cmd.exe 窗口，假定它是 Claude 窗口
+ * 5. 如果只有一个终端窗口（任意类型），使用它
+ *
+ * @param projectName - 可选，项目名称用于精确匹配
+ * @returns Promise<{found: boolean; windowTitle?: string; processName?: string}>
+ */
+async function detectClaudeWindow(projectName?: string): Promise<{ found: boolean; windowTitle?: string; processName?: string }> {
+  return new Promise((resolve) => {
+    // 安全转义项目名称（用于 PowerShell 字符串）
+    const safeProjectName = projectName ? projectName.replace(/'/g, "''") : ''
+
+    // PowerShell 脚本：查找 Claude 相关的终端窗口
+    const psScript = `
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$projectName = '${safeProjectName}'
+
+# 查找所有可能的终端进程
+$allTerminals = Get-Process | Where-Object {
+    ($_.ProcessName -eq "WindowsTerminal" -or
+     $_.ProcessName -eq "powershell" -or
+     $_.ProcessName -eq "pwsh" -or
+     $_.ProcessName -eq "cmd") -and
+    $_.MainWindowHandle -ne 0 -and
+    $_.MainWindowTitle -ne ""
+}
+
+$targetWindow = $null
+$strategy = ""
+
+# 策略 0：精确匹配 "Claude - 项目名"（VibeCraft 创建的窗口）
+if ($projectName) {
+    $expectedTitle = "Claude - $projectName"
+    $match = $allTerminals | Where-Object {
+        $_.MainWindowTitle -eq $expectedTitle
+    } | Select-Object -First 1
+    if ($match) {
+        $targetWindow = $match
+        $strategy = "策略0:精确匹配项目窗口"
+    }
+}
+
+# 策略 1：标题包含 "claude"（最明确的标识）
+if (-not $targetWindow) {
+    $match = $allTerminals | Where-Object {
+        $_.MainWindowTitle -like "*claude*" -or
+        $_.MainWindowTitle -like "*Claude*" -or
+        $_.MainWindowTitle -like "*CLAUDE*"
+    } | Select-Object -First 1
+
+    if ($match) {
+        $targetWindow = $match
+        $strategy = "策略1:claude关键字"
+    }
+}
+
+# 策略 2：标题包含 ✳ 符号（Claude Code 任务标识符）
+if (-not $targetWindow) {
+    $match = $allTerminals | Where-Object {
+        $_.MainWindowTitle -match [char]0x2733  # ✳ 符号的 Unicode
+    } | Select-Object -First 1
+    if ($match) {
+        $targetWindow = $match
+        $strategy = "策略2:✳符号"
+    }
+}
+
+# 策略 3：如果只有一个 cmd.exe 窗口，假定它是 Claude 窗口
+if (-not $targetWindow) {
+    $cmdWindows = $allTerminals | Where-Object { $_.ProcessName -eq "cmd" }
+    if ($cmdWindows -and @($cmdWindows).Count -eq 1) {
+        $targetWindow = $cmdWindows
+        $strategy = "策略3:唯一cmd窗口"
+    }
+}
+
+# 策略 4：如果只有一个终端窗口（任意类型），使用它
+if (-not $targetWindow) {
+    if ($allTerminals -and @($allTerminals).Count -eq 1) {
+        $targetWindow = $allTerminals
+        $strategy = "策略4:唯一终端窗口"
+    }
+}
+
+if ($targetWindow) {
+    Write-Output "FOUND|$($targetWindow.ProcessName)|$($targetWindow.MainWindowTitle)|$strategy"
+} else {
+    Write-Output "NOT_FOUND|终端窗口数:$(@($allTerminals).Count)"
+}
+`
+
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', psScript],
+      { ...EXEC_OPTIONS, timeout: 5000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          log(`[detectClaudeWindow] PowerShell 错误: ${stderr || error.message}`)
+          resolve({ found: false })
+          return
+        }
+
+        const output = stdout.trim()
+        if (output.startsWith('FOUND|')) {
+          const parts = output.split('|')
+          const processName = parts[1] || ''
+          const windowTitle = parts[2] || ''
+          const strategy = parts[3] || ''
+          log(`[detectClaudeWindow] 找到 Claude 窗口 (${strategy}): ${processName} - ${windowTitle}`)
+          resolve({ found: true, processName, windowTitle })
+        } else {
+          // 输出格式: NOT_FOUND|终端窗口数:X
+          log(`[detectClaudeWindow] 未找到 Claude 窗口 (${output})`)
+          resolve({ found: false })
+        }
+      }
+    )
+  })
+}
+
+/**
  * Send text to Windows clipboard and paste to target window using PowerShell.
  * Uses clipboard + SendKeys as Windows doesn't have tmux.
  *
- * 搜索策略（按优先级）：
- * 1. 首先搜索 Windows Terminal 进程，查找标题包含项目路径或 "claude" 的窗口
- * 2. 排除 VS Code 窗口（Code 进程）
- * 3. 如果找到多个 Terminal 窗口，优先选择标题包含项目路径的
+ * 搜索策略（单主窗口模式，按优先级）：
+ * 0. 精确匹配: 标题为 "Claude - 项目名"（VibeCraft 创建的窗口）
+ * 1. 查找标题包含项目名称 + Claude 关键字的窗口
+ * 2. 查找标题包含 "claude" 关键字的窗口
+ * 3. 查找标题包含 ✳ 符号的窗口（Claude Code 特征）
+ * 4. 如果只有一个 cmd.exe 窗口，假定它是 Claude 窗口
+ * 5. 如果只有一个终端窗口，使用它
+ * 6. 如果都找不到，返回错误
  *
  * @param text - 要发送的文本
  * @param projectPath - 可选，项目路径用于精确匹配窗口
@@ -263,13 +514,14 @@ async function sendToWindowsClipboard(text: string, projectPath?: string): Promi
 
     // 提取项目文件夹名称用于匹配
     const projectName = projectPath ? projectPath.split(/[/\\]/).filter(Boolean).pop() || '' : ''
+    // 安全转义项目名称（用于 PowerShell 字符串）
+    const safeProjectName = projectName.replace(/'/g, "''")
 
     // PowerShell 脚本功能：
     // 1. 从 UTF-8 文件读取文本
     // 2. 设置剪贴板内容
-    // 3. 查找 Windows Terminal 窗口（排除 VS Code）
-    // 4. 优先匹配包含项目路径或 claude 的窗口
-    // 5. 发送 Ctrl+V 粘贴 + Enter 提交
+    // 3. 通过窗口标题查找 Claude 窗口
+    // 4. 发送 Ctrl+V 粘贴 + Enter 提交
     const psScript = `
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
@@ -281,69 +533,88 @@ if ($text) { $text = $text.TrimEnd() }
 # 设置剪贴板
 [System.Windows.Forms.Clipboard]::SetText($text)
 
-# 项目名称（用于精确匹配）
-$projectName = '${projectName}'
+# 参数
+$projectName = '${safeProjectName}'
 
-# 查找所有 Windows Terminal 窗口（排除 VS Code）
-$terminalWindows = Get-Process | Where-Object {
-    $_.ProcessName -eq "WindowsTerminal" -and
+$targetWindow = $null
+
+# 查找所有可能的终端窗口（Windows Terminal、PowerShell、cmd）
+$allTerminals = Get-Process | Where-Object {
+    ($_.ProcessName -eq "WindowsTerminal" -or
+     $_.ProcessName -eq "powershell" -or
+     $_.ProcessName -eq "pwsh" -or
+     $_.ProcessName -eq "cmd") -and
     $_.MainWindowHandle -ne 0 -and
     $_.MainWindowTitle -ne ""
 }
 
-Write-Output "找到 $($terminalWindows.Count) 个 Windows Terminal 窗口"
+Write-Output "找到 $(@($allTerminals).Count) 个终端窗口"
 
-$targetWindow = $null
-
-# 策略 1：如果有项目名称，优先查找标题包含项目名称的窗口
-if ($projectName -and $terminalWindows.Count -gt 0) {
-    $match = $terminalWindows | Where-Object {
-        $_.MainWindowTitle -like "*$projectName*"
+# 策略 0：精确匹配 "Claude - 项目名"（VibeCraft 创建的窗口）
+if ($projectName -and @($allTerminals).Count -gt 0) {
+    $expectedTitle = "Claude - $projectName"
+    $match = $allTerminals | Where-Object {
+        $_.MainWindowTitle -eq $expectedTitle
     } | Select-Object -First 1
     if ($match) {
         $targetWindow = $match
-        Write-Output "匹配项目名称: $projectName"
+        Write-Output "策略0: 精确匹配项目窗口: $expectedTitle"
     }
 }
 
-# 策略 2：查找标题包含 "claude" 的 Terminal 窗口
-if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
-    $match = $terminalWindows | Where-Object {
-        $_.MainWindowTitle -like "*claude*"
+# 策略 1：查找标题包含项目名称 + Claude 关键字的窗口
+if (-not $targetWindow -and $projectName -and @($allTerminals).Count -gt 0) {
+    $match = $allTerminals | Where-Object {
+        $_.MainWindowTitle -like "*$projectName*" -and
+        ($_.MainWindowTitle -like "*claude*" -or
+         $_.MainWindowTitle -like "*Claude*" -or
+         $_.MainWindowTitle -like "*CLAUDE*" -or
+         $_.MainWindowTitle -match [char]0x2733)  # ✳ 符号
     } | Select-Object -First 1
     if ($match) {
         $targetWindow = $match
-        Write-Output "匹配 claude 关键字"
+        Write-Output "策略1: 匹配项目名称 + Claude: $projectName"
     }
 }
 
-# 策略 3：使用任意 Windows Terminal 窗口
-if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
-    $targetWindow = $terminalWindows | Select-Object -First 1
-    Write-Output "使用第一个 Terminal 窗口"
+# 策略 2：查找标题包含 "claude" 的窗口
+if (-not $targetWindow -and @($allTerminals).Count -gt 0) {
+    $match = $allTerminals | Where-Object {
+        $_.MainWindowTitle -like "*claude*" -or
+        $_.MainWindowTitle -like "*Claude*" -or
+        $_.MainWindowTitle -like "*CLAUDE*"
+    } | Select-Object -First 1
+    if ($match) {
+        $targetWindow = $match
+        Write-Output "策略2: 匹配 claude 关键字"
+    }
 }
 
-# 策略 4：查找 PowerShell 独立窗口（非 VS Code）
+# 策略 3：查找标题包含 ✳ 符号的窗口（Claude Code 特征）
+if (-not $targetWindow -and @($allTerminals).Count -gt 0) {
+    $match = $allTerminals | Where-Object {
+        $_.MainWindowTitle -match [char]0x2733  # ✳ 符号
+    } | Select-Object -First 1
+    if ($match) {
+        $targetWindow = $match
+        Write-Output "策略3: 匹配 Claude Code 特征符号"
+    }
+}
+
+# 策略 4：如果只有一个 cmd.exe 窗口，假定它是 Claude 窗口
 if (-not $targetWindow) {
-    $psWindows = Get-Process | Where-Object {
-        ($_.ProcessName -eq "powershell" -or $_.ProcessName -eq "pwsh") -and
-        $_.MainWindowHandle -ne 0 -and
-        $_.MainWindowTitle -ne "" -and
-        $_.MainWindowTitle -notlike "*Visual Studio Code*"
+    $cmdWindows = $allTerminals | Where-Object { $_.ProcessName -eq "cmd" }
+    if ($cmdWindows -and @($cmdWindows).Count -eq 1) {
+        $targetWindow = $cmdWindows
+        Write-Output "策略4: 唯一 cmd.exe 窗口"
     }
-    if ($psWindows.Count -gt 0) {
-        if ($projectName) {
-            $match = $psWindows | Where-Object { $_.MainWindowTitle -like "*$projectName*" } | Select-Object -First 1
-            if ($match) { $targetWindow = $match }
-        }
-        if (-not $targetWindow) {
-            $match = $psWindows | Where-Object { $_.MainWindowTitle -like "*claude*" } | Select-Object -First 1
-            if ($match) { $targetWindow = $match }
-        }
-        if (-not $targetWindow) {
-            $targetWindow = $psWindows | Select-Object -First 1
-        }
-        Write-Output "使用 PowerShell 窗口"
+}
+
+# 策略 5：如果只有一个终端窗口（任意类型），使用它
+if (-not $targetWindow) {
+    if ($allTerminals -and @($allTerminals).Count -eq 1) {
+        $targetWindow = $allTerminals
+        Write-Output "策略5: 唯一终端窗口"
     }
 }
 
@@ -374,9 +645,9 @@ if ($targetWindow) {
     # 发送 Enter 提交
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 
-    Write-Output "OK - 已发送到 Windows Terminal"
+    Write-Output "OK - 已发送到 Claude 窗口"
 } else {
-    Write-Error "未找到 Windows Terminal 窗口。请确保已打开 Windows Terminal 并在其中运行 Claude CLI。"
+    Write-Error "未找到 Claude 窗口。请确保 Claude CLI 正在运行（窗口标题包含 'claude' 或 ✳ 符号）。"
     exit 1
 }
 `
@@ -415,30 +686,49 @@ async function activateWindowsTerminal(projectPath?: string): Promise<{ success:
 
 $projectName = '${projectName}'
 
-# 查找所有 Windows Terminal 窗口
+# 查找所有终端窗口（Windows Terminal、PowerShell、cmd）
 $terminalWindows = Get-Process | Where-Object {
-    $_.ProcessName -eq "WindowsTerminal" -and
+    ($_.ProcessName -eq "WindowsTerminal" -or
+     $_.ProcessName -eq "powershell" -or
+     $_.ProcessName -eq "pwsh" -or
+     $_.ProcessName -eq "cmd") -and
     $_.MainWindowHandle -ne 0 -and
     $_.MainWindowTitle -ne ""
 }
 
 $targetWindow = $null
 
-# 策略 1：查找标题包含项目名称的窗口
-if ($projectName -and $terminalWindows.Count -gt 0) {
-    $match = $terminalWindows | Where-Object { $_.MainWindowTitle -like "*$projectName*" } | Select-Object -First 1
+# 策略 1：查找 VibeCraft 创建的窗口（标题以 "Claude - " 开头）
+if ($terminalWindows.Count -gt 0) {
+    $match = $terminalWindows | Where-Object { $_.MainWindowTitle -like "Claude - *" } | Select-Object -First 1
     if ($match) { $targetWindow = $match }
 }
 
-# 策略 2：查找标题包含 claude 的窗口
-if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
-    $match = $terminalWindows | Where-Object { $_.MainWindowTitle -like "*claude*" } | Select-Object -First 1
+# 策略 2：查找标题包含项目名称 + Claude 的窗口
+if (-not $targetWindow -and $projectName -and $terminalWindows.Count -gt 0) {
+    $match = $terminalWindows | Where-Object {
+        $_.MainWindowTitle -like "*$projectName*" -and
+        ($_.MainWindowTitle -like "*claude*" -or $_.MainWindowTitle -like "*Claude*")
+    } | Select-Object -First 1
     if ($match) { $targetWindow = $match }
 }
 
-# 策略 3：使用任意 Windows Terminal 窗口
+# 策略 3：查找标题包含 claude 的窗口
 if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
-    $targetWindow = $terminalWindows | Select-Object -First 1
+    $match = $terminalWindows | Where-Object {
+        $_.MainWindowTitle -like "*claude*" -or
+        $_.MainWindowTitle -like "*Claude*" -or
+        $_.MainWindowTitle -like "*CLAUDE*"
+    } | Select-Object -First 1
+    if ($match) { $targetWindow = $match }
+}
+
+# 策略 4：查找标题包含 ✳ 符号的窗口（Claude Code 特征）
+if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
+    $match = $terminalWindows | Where-Object {
+        $_.MainWindowTitle -match [char]0x2733  # ✳ 符号
+    } | Select-Object -First 1
+    if ($match) { $targetWindow = $match }
 }
 
 if ($targetWindow) {
@@ -1219,70 +1509,59 @@ function createSession(options: CreateSessionRequest = {}): Promise<ManagedSessi
 
     // Platform-specific session spawning
     if (IS_WINDOWS) {
-      // Windows 多窗口模式：为每个项目启动独立的 Claude 实例
-      // 使用 Windows Terminal (wt.exe) 启动 Claude CLI
-      log(`[Windows] 启动 Claude 在 Windows Terminal 中`)
-      log(`[Windows] 工作目录: ${cwd}`)
-      log(`[Windows] 命令: ${claudeCmd}`)
+      // Windows: 自动启动模式
+      // 1. 首先检测是否有匹配项目的 Claude 窗口
+      // 2. 如果没有，自动启动新的 Claude 窗口
+      // 3. 使用 Windows Terminal (wt.exe) 启动，设置窗口标题
 
-      // 使用 PowerShell 启动 Windows Terminal 或 cmd
-      // 这样可以确保环境变量正确传递
-      const wtPath = join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WindowsApps', 'wt.exe')
+      const projectName = cwd.split(/[/\\]/).filter(Boolean).pop() || 'Unknown'
+      log(`[Windows] 自动启动模式 - 项目: ${projectName}`)
+      log(`[Windows] Session 目录: ${cwd}`)
 
-      // 检查 Windows Terminal 是否存在
-      const useWT = existsSync(wtPath)
-      log(`[Windows] Windows Terminal 路径: ${wtPath}, 存在: ${useWT}`)
+      // 步骤 1: 使用 detectClaudeWindow() 检测已有的 Claude 窗口
+      detectClaudeWindow(projectName).then(async (detection) => {
+        let windowTitle: string | undefined = detection.windowTitle
 
-      if (useWT) {
-        // 使用 Windows Terminal
-        const wtArgs = ['-d', cwd, '--title', name, '--', 'cmd', '/k', claudeCmd]
-        execFile(wtPath, wtArgs, { ...EXEC_OPTIONS, cwd }, (error) => {
-          if (error) {
-            log(`[Windows] Windows Terminal 启动失败: ${error.message}`)
-            // 回退到 PowerShell 方式
-            launchWithPowerShell()
+        // 步骤 2: 如果没有找到窗口，自动启动新窗口
+        if (!detection.found) {
+          log(`[Windows] 未检测到 Claude 窗口，自动启动新窗口...`)
+
+          // 使用 launchClaudeWindow 启动新窗口
+          const launchResult = await launchClaudeWindow(cwd, claudeArgs)
+
+          if (!launchResult.success) {
+            log(`[Windows] 自动启动 Claude 窗口失败: ${launchResult.error}`)
+            reject(new Error(
+              `自动启动 Claude 窗口失败: ${launchResult.error}\n\n` +
+              '请确保已安装 Windows Terminal (wt.exe)。\n' +
+              '或手动启动 Claude CLI：\n' +
+              `  1. 打开终端（Windows Terminal 或 cmd）\n` +
+              `  2. cd "${cwd}"\n` +
+              `  3. ${claudeCmd}\n` +
+              '然后重新创建 session。'
+            ))
             return
           }
-          createWindowsSession()
-        })
-      } else {
-        // 没有 Windows Terminal，使用 PowerShell 启动
-        launchWithPowerShell()
-      }
 
-      function launchWithPowerShell() {
-        // 使用 PowerShell 启动新窗口，确保环境变量正确
-        const psScript = `
-          $host.UI.RawUI.WindowTitle = '${name.replace(/'/g, "''")}'
-          Set-Location -Path '${cwd.replace(/'/g, "''")}'
-          & ${claudeCmd}
-        `
-        // Start-Process 会继承当前进程的环境变量
-        const psCmd = `Start-Process powershell -ArgumentList '-NoExit', '-Command', '${psScript.replace(/'/g, "''").replace(/\n/g, '; ')}'`
+          windowTitle = launchResult.windowTitle
+          log(`[Windows] 成功启动 Claude 窗口: ${windowTitle}`)
+        } else {
+          log(`[Windows] 检测到 Claude 窗口: ${detection.processName} - ${detection.windowTitle}`)
+        }
 
-        exec(`powershell -Command "${psCmd}"`, { ...EXEC_OPTIONS }, (psError) => {
-          if (psError) {
-            log(`[Windows] PowerShell 启动失败: ${psError.message}`)
-            reject(new Error(`无法启动 Claude: ${psError.message}`))
-            return
-          }
-          createWindowsSession()
-        })
-      }
-
-      function createWindowsSession() {
         const session: ManagedSession = {
           id,
           name,
-          tmuxSession, // 保留兼容性
+          tmuxSession, // 保留兼容性（Unix 用）
           status: 'idle',
           createdAt: Date.now(),
           lastActivity: Date.now(),
           cwd,
+          windowTitle, // 保存窗口标题（检测到的或新启动的）
         }
 
         managedSessions.set(id, session)
-        log(`[Windows] 创建 session: ${name} (${id.slice(0, 8)}) -> 目录: "${cwd}"`)
+        log(`[Windows] 创建 session: ${name} (${id.slice(0, 8)}) -> 窗口: "${windowTitle}"`)
 
         // 跟踪此 session 的 git 状态
         if (cwd) {
@@ -1295,7 +1574,10 @@ function createSession(options: CreateSessionRequest = {}): Promise<ManagedSessi
         saveSessions()
 
         resolve(session)
-      }
+      }).catch((err) => {
+        log(`[Windows] 检测 Claude 窗口失败: ${err.message}`)
+        reject(new Error(`检测 Claude 窗口失败: ${err.message}`))
+      })
     } else {
       // Unix: Spawn tmux session with claude using execFile to prevent shell injection
       // Arguments are passed as array, not interpolated into a shell string

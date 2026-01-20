@@ -295,6 +295,8 @@ export interface ManagedSession {
     q: number
     r: number
   }
+  /** Windows: 检测到的窗口标题，用于识别 Claude 会话窗口 */
+  windowTitle?: string
 }
 
 /** Git repository status */
