@@ -29,26 +29,39 @@ import { homedir } from 'os'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(__dirname, '..')
 
+// Platform detection
+const IS_WINDOWS = process.platform === 'win32'
+
 // ============================================================================
 // Health Checks
 // ============================================================================
 
-function checkJq() {
+/**
+ * Cross-platform command existence check
+ */
+function commandExists(cmd) {
   try {
-    execSync('which jq', { stdio: 'ignore' })
+    if (IS_WINDOWS) {
+      execSync(`where ${cmd}`, { stdio: 'ignore' })
+    } else {
+      execSync(`which ${cmd}`, { stdio: 'ignore' })
+    }
     return true
   } catch {
     return false
   }
 }
 
+function checkJq() {
+  // On Windows, the Node.js hook handles JSON natively - jq is not needed
+  if (IS_WINDOWS) return true
+  return commandExists('jq')
+}
+
 function checkTmux() {
-  try {
-    execSync('which tmux', { stdio: 'ignore' })
-    return true
-  } catch {
-    return false
-  }
+  // tmux is not available on Windows
+  if (IS_WINDOWS) return false
+  return commandExists('tmux')
 }
 
 function checkHooksConfigured() {
@@ -83,14 +96,19 @@ function printHealthCheck() {
 
   let warnings = []
 
-  if (!jqOk) {
+  if (!jqOk && !IS_WINDOWS) {
     warnings.push(`  [!] jq not found - hooks won't work without it
       Install: brew install jq (macOS) or apt install jq (Linux)`)
   }
 
-  if (!tmuxOk) {
+  if (!tmuxOk && !IS_WINDOWS) {
     warnings.push(`  [!] tmux not found - session management won't work
       Install: brew install tmux (macOS) or apt install tmux (Linux)`)
+  }
+
+  if (IS_WINDOWS && !tmuxOk) {
+    // On Windows, this is expected - use Windows clipboard integration instead
+    warnings.push(`  [i] Windows mode - using clipboard integration for session management`)
   }
 
   if (!hooksResult.configured) {
@@ -142,7 +160,9 @@ GitHub:  https://github.com/nearcyan/vibecraft
 
 // Hook path command
 if (args.includes('--hook-path')) {
-  console.log(resolve(ROOT, 'hooks/vibecraft-hook.sh'))
+  // Return platform-appropriate hook path
+  const hookFile = IS_WINDOWS ? 'hooks/vibecraft-hook.js' : 'hooks/vibecraft-hook.sh'
+  console.log(resolve(ROOT, hookFile))
   process.exit(0)
 }
 
@@ -187,8 +207,11 @@ if (args[0] === 'setup') {
   // ==========================================================================
 
   const vibecraftHooksDir = join(homedir(), '.vibecraft', 'hooks')
-  const installedHookPath = join(vibecraftHooksDir, 'vibecraft-hook.sh')
-  const sourceHookPath = resolve(ROOT, 'hooks/vibecraft-hook.sh')
+
+  // Platform-specific hook files
+  const hookFileName = IS_WINDOWS ? 'vibecraft-hook.js' : 'vibecraft-hook.sh'
+  const installedHookPath = join(vibecraftHooksDir, hookFileName)
+  const sourceHookPath = resolve(ROOT, 'hooks', hookFileName)
 
   // Ensure hooks directory exists
   if (!existsSync(vibecraftHooksDir)) {
@@ -205,7 +228,9 @@ if (args[0] === 'setup') {
 
   try {
     copyFileSync(sourceHookPath, installedHookPath)
-    chmodSync(installedHookPath, 0o755) // Make executable
+    if (!IS_WINDOWS) {
+      chmodSync(installedHookPath, 0o755) // Make executable (Unix only)
+    }
     console.log(`Installed hook: ${installedHookPath}`)
   } catch (e) {
     console.error(`ERROR: Failed to install hook script: ${e.message}`)
@@ -249,12 +274,17 @@ if (args[0] === 'setup') {
   }
 
   // Hook configurations - use installed path (stable location)
+  // On Windows, we need to run the Node.js hook with "node" explicitly
+  const hookCommand = IS_WINDOWS
+    ? `node "${installedHookPath}"`
+    : installedHookPath
+
   const toolHookEntry = {
     matcher: '*',
-    hooks: [{ type: 'command', command: installedHookPath, timeout: 5 }]
+    hooks: [{ type: 'command', command: hookCommand, timeout: 5 }]
   }
   const genericHookEntry = {
-    hooks: [{ type: 'command', command: installedHookPath, timeout: 5 }]
+    hooks: [{ type: 'command', command: hookCommand, timeout: 5 }]
   }
 
   // Initialize hooks object
@@ -311,16 +341,22 @@ if (args[0] === 'setup') {
   // Check dependencies
   let hasWarnings = false
 
-  if (!checkJq()) {
+  if (!checkJq() && !IS_WINDOWS) {
     hasWarnings = true
     console.log('\n[!] Warning: jq not found')
     console.log('    Install: brew install jq (macOS) or apt install jq (Linux)')
   }
 
-  if (!checkTmux()) {
+  if (!checkTmux() && !IS_WINDOWS) {
     hasWarnings = true
     console.log('\n[!] Warning: tmux not found')
     console.log('    Install: brew install tmux (macOS) or apt install tmux (Linux)')
+  }
+
+  if (IS_WINDOWS) {
+    console.log('\n[i] Windows detected')
+    console.log('    Using Node.js hook (no jq dependency)')
+    console.log('    Session management via clipboard integration')
   }
 
   if (!hasWarnings) {
@@ -330,10 +366,22 @@ if (args[0] === 'setup') {
   // Check if server is already running (likely an update)
   let serverRunning = false
   try {
-    const res = execSync('curl -s http://localhost:4003/health', { timeout: 2000 })
-    if (res.toString().includes('"ok":true')) {
-      serverRunning = true
-    }
+    // Use Node.js built-in fetch for cross-platform HTTP check
+    const http = await import('http')
+    await new Promise((resolve, reject) => {
+      const req = http.get('http://localhost:4003/health', { timeout: 2000 }, (res) => {
+        let data = ''
+        res.on('data', chunk => data += chunk)
+        res.on('end', () => {
+          if (data.includes('"ok":true')) {
+            serverRunning = true
+          }
+          resolve()
+        })
+      })
+      req.on('error', () => resolve())
+      req.on('timeout', () => { req.destroy(); resolve() })
+    })
   } catch {}
 
   if (serverRunning) {
@@ -449,10 +497,16 @@ if (args[0] === 'uninstall') {
   // Step 3: Remove hook script (but keep data)
   // ==========================================================================
 
-  const hookScript = join(homedir(), '.vibecraft', 'hooks', 'vibecraft-hook.sh')
-  if (existsSync(hookScript)) {
-    rmSync(hookScript)
-    console.log(`Removed: ${hookScript}`)
+  // Remove both Windows and Unix hook scripts if they exist
+  const hookScripts = [
+    join(homedir(), '.vibecraft', 'hooks', 'vibecraft-hook.sh'),
+    join(homedir(), '.vibecraft', 'hooks', 'vibecraft-hook.js'),
+  ]
+  for (const hookScript of hookScripts) {
+    if (existsSync(hookScript)) {
+      rmSync(hookScript)
+      console.log(`Removed: ${hookScript}`)
+    }
   }
 
   // Remove hooks directory if empty
@@ -509,8 +563,10 @@ if (args[0] === 'doctor') {
     issues.push('Node.js 18+ required')
   }
 
-  // jq
-  if (checkJq()) {
+  // jq (not needed on Windows - Node.js hook handles JSON natively)
+  if (IS_WINDOWS) {
+    console.log('  ✓ jq (not needed - using Node.js hook)')
+  } else if (checkJq()) {
     try {
       const jqVersion = execSync('jq --version 2>&1', { encoding: 'utf-8' }).trim()
       console.log(`  ✓ jq (${jqVersion})`)
@@ -522,8 +578,10 @@ if (args[0] === 'doctor') {
     issues.push('jq not installed - hooks will not work')
   }
 
-  // tmux
-  if (checkTmux()) {
+  // tmux (not available on Windows - uses clipboard integration instead)
+  if (IS_WINDOWS) {
+    console.log('  ✓ tmux (not needed - using clipboard integration)')
+  } else if (checkTmux()) {
     try {
       const tmuxVersion = execSync('tmux -V 2>&1', { encoding: 'utf-8' }).trim()
       console.log(`  ✓ tmux (${tmuxVersion})`)
@@ -535,13 +593,17 @@ if (args[0] === 'doctor') {
     warnings.push('tmux not installed - browser prompt feature won\'t work')
   }
 
-  // curl
-  try {
-    execSync('which curl', { stdio: 'ignore' })
-    console.log('  ✓ curl')
-  } catch {
-    console.log('  ✗ curl not found')
-    issues.push('curl not installed - hooks cannot send events to server')
+  // curl (not needed - Node.js hook uses built-in http module)
+  if (IS_WINDOWS) {
+    console.log('  ✓ curl (not needed - using Node.js http)')
+  } else {
+    try {
+      execSync('which curl', { stdio: 'ignore' })
+      console.log('  ✓ curl')
+    } catch {
+      console.log('  ⚠ curl not found (optional - hook will still work)')
+      warnings.push('curl not installed - hook notifications may be delayed')
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -549,18 +611,23 @@ if (args[0] === 'doctor') {
   // -------------------------------------------------------------------------
   console.log('\n[2/6] Checking hook script...')
 
-  const hookScript = join(homedir(), '.vibecraft', 'hooks', 'vibecraft-hook.sh')
+  const hookFileName = IS_WINDOWS ? 'vibecraft-hook.js' : 'vibecraft-hook.sh'
+  const hookScript = join(homedir(), '.vibecraft', 'hooks', hookFileName)
   if (existsSync(hookScript)) {
     console.log(`  ✓ Hook script exists: ${hookScript}`)
 
-    // Check if executable
-    try {
-      const { accessSync, constants } = await import('fs')
-      accessSync(hookScript, constants.X_OK)
-      console.log('  ✓ Hook script is executable')
-    } catch {
-      console.log('  ✗ Hook script is not executable')
-      issues.push(`Hook script not executable. Run: chmod +x ${hookScript}`)
+    // Check if executable (Unix only)
+    if (!IS_WINDOWS) {
+      try {
+        const { accessSync, constants } = await import('fs')
+        accessSync(hookScript, constants.X_OK)
+        console.log('  ✓ Hook script is executable')
+      } catch {
+        console.log('  ✗ Hook script is not executable')
+        issues.push(`Hook script not executable. Run: chmod +x ${hookScript}`)
+      }
+    } else {
+      console.log('  ✓ Hook script is Node.js (no execute permission needed)')
     }
   } else {
     console.log(`  ✗ Hook script not found: ${hookScript}`)
@@ -670,11 +737,18 @@ if (args[0] === 'doctor') {
   console.log('\n[5/6] Checking server status...')
 
   try {
-    const healthRes = execSync('curl -s http://localhost:4003/health', {
-      timeout: 3000,
-      encoding: 'utf-8'
+    // Use Node.js http module for cross-platform health check
+    const http = await import('http')
+    const healthData = await new Promise((resolve, reject) => {
+      const req = http.get('http://localhost:4003/health', { timeout: 3000 }, (res) => {
+        let data = ''
+        res.on('data', chunk => data += chunk)
+        res.on('end', () => resolve(data))
+      })
+      req.on('error', reject)
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')) })
     })
-    const health = JSON.parse(healthRes)
+    const health = JSON.parse(healthData)
     if (health.ok) {
       console.log(`  ✓ Server running on port 4003`)
       console.log(`    Version: ${health.version || 'unknown'}`)
@@ -687,11 +761,14 @@ if (args[0] === 'doctor') {
   }
 
   // -------------------------------------------------------------------------
-  // 6. Check tmux sessions
+  // 6. Check tmux sessions (Unix) / Windows session info
   // -------------------------------------------------------------------------
-  console.log('\n[6/6] Checking tmux sessions...')
+  console.log('\n[6/6] Checking session management...')
 
-  if (checkTmux()) {
+  if (IS_WINDOWS) {
+    console.log('  ✓ Windows mode - using clipboard integration')
+    console.log('    Sessions are managed via PowerShell/clipboard')
+  } else if (checkTmux()) {
     try {
       const sessions = execSync('tmux list-sessions 2>/dev/null', {
         encoding: 'utf-8',
@@ -795,14 +872,27 @@ if (existsSync(compiledPath)) {
 } else {
   // Fall back to tsx (development)
   console.log('(dev mode - using tsx)')
-  server = spawn('npx', ['tsx', sourcePath], {
-    cwd: ROOT,
-    env: {
-      ...process.env,
-      VIBECRAFT_PORT: port,
-    },
-    stdio: 'inherit',
-  })
+  if (IS_WINDOWS) {
+    // Windows: use shell with quoted path for spaces
+    server = spawn(`npx tsx "${sourcePath}"`, [], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        VIBECRAFT_PORT: port,
+      },
+      stdio: 'inherit',
+      shell: true,
+    })
+  } else {
+    server = spawn('npx', ['tsx', sourcePath], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        VIBECRAFT_PORT: port,
+      },
+      stdio: 'inherit',
+    })
+  }
 }
 
 server.on('error', (err) => {

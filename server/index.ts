@@ -9,12 +9,15 @@
  * 5. Proxies voice input to Deepgram for transcription
  */
 
+// 加载环境变量 - 必须在所有其他导入之前
+import 'dotenv/config'
+
 import { createServer, IncomingMessage, ServerResponse } from 'http'
 import { WebSocketServer, WebSocket, RawData } from 'ws'
 import { watch } from 'chokidar'
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, unlinkSync, statSync } from 'fs'
-import { exec, execFile } from 'child_process'
-import { dirname, resolve, join, extname } from 'path'
+import { exec, execFile, spawn } from 'child_process'
+import { dirname, resolve, join, extname, sep } from 'path'
 import { hostname } from 'os'
 import { randomUUID, randomBytes } from 'crypto'
 import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk'
@@ -25,6 +28,7 @@ import type {
   ClientMessage,
   PreToolUseEvent,
   PostToolUseEvent,
+  UserPromptSubmitEvent,
   ManagedSession,
   CreateSessionRequest,
   UpdateSessionRequest,
@@ -71,10 +75,11 @@ const VERSION = getPackageVersion()
 // Configuration (env vars override DEFAULTS from shared/defaults.ts)
 // ============================================================================
 
-/** Expand ~ to home directory in paths */
+/** Expand ~ to home directory in paths (cross-platform) */
 function expandHome(path: string): string {
   if (path.startsWith('~/') || path === '~') {
-    return path.replace('~', process.env.HOME || '')
+    const home = process.env.HOME || process.env.USERPROFILE || ''
+    return path.replace('~', home)
   }
   return path
 }
@@ -87,6 +92,7 @@ const DEBUG = process.env.VIBECRAFT_DEBUG === 'true'
 const TMUX_SESSION = process.env.VIBECRAFT_TMUX_SESSION ?? DEFAULTS.TMUX_SESSION
 const SESSIONS_FILE = resolve(expandHome(process.env.VIBECRAFT_SESSIONS_FILE ?? DEFAULTS.SESSIONS_FILE))
 const TILES_FILE = resolve(expandHome(process.env.VIBECRAFT_TILES_FILE ?? '~/.vibecraft/data/tiles.json'))
+const DATA_DIR = resolve(expandHome(process.env.VIBECRAFT_DATA_DIR ?? '~/.vibecraft/data'))
 
 /** Time before a "working" session auto-transitions to idle (failsafe for missed events) */
 const WORKING_TIMEOUT_MS = 120_000 // 2 minutes
@@ -98,16 +104,26 @@ const MAX_BODY_SIZE = 1024 * 1024
 const WORKING_CHECK_INTERVAL_MS = 10_000 // 10 seconds
 
 /** Extended PATH for exec() - includes Homebrew and user paths for macOS/Linux */
-const HOME = process.env.HOME || ''
+const HOME = process.env.HOME || process.env.USERPROFILE || ''
+
+/** Platform-specific PATH separator */
+const PATH_SEPARATOR = process.platform === 'win32' ? ';' : ':'
+
 const EXEC_PATH = [
   `${HOME}/.local/bin`,     // User local bin (Claude CLI default location)
   '/opt/homebrew/bin',      // macOS Apple Silicon Homebrew
   '/usr/local/bin',         // macOS Intel Homebrew / Linux local
   process.env.PATH || '',
-].join(':')
+].join(PATH_SEPARATOR)
 
 /** Options for exec() with extended PATH */
 const EXEC_OPTIONS = { env: { ...process.env, PATH: EXEC_PATH } }
+
+/** Platform detection */
+const IS_WINDOWS = process.platform === 'win32'
+
+/** Windows target window title pattern for Claude Code */
+const WINDOWS_TARGET_PATTERN = process.env.VIBECRAFT_WINDOWS_TARGET || 'Claude'
 
 /** Deepgram API key from environment */
 const DEEPGRAM_API_KEY_ENV = 'DEEPGRAM_API_KEY'
@@ -162,8 +178,11 @@ function validateDirectoryPath(inputPath: string): string {
   }
 
   // Reject paths with shell metacharacters that could enable injection
-  // Even with execFile, tmux passes commands to a shell
-  const dangerousChars = /[;&|`$(){}[\]<>\\'"!#*?]/
+  // On Windows: Allow ' (valid in paths) and \ (path separator), properly escaped in PowerShell
+  // On Unix: Strict validation since tmux passes commands to a shell
+  const dangerousChars = IS_WINDOWS
+    ? /[;&|`$(){}[\]<>"!#*?]/     // Allow ' and \ on Windows (path separators + apostrophes)
+    : /[;&|`$(){}[\]<>\\'"!#*?]/  // Strict for Unix/tmux
   if (dangerousChars.test(resolved)) {
     throw new Error(`Directory path contains invalid characters: ${inputPath}`)
   }
@@ -219,11 +238,270 @@ function collectRequestBody(req: IncomingMessage, maxSize: number = MAX_BODY_SIZ
 }
 
 /**
+ * Send text to Windows clipboard and paste to target window using PowerShell.
+ * Uses clipboard + SendKeys as Windows doesn't have tmux.
+ *
+ * 搜索策略（按优先级）：
+ * 1. 首先搜索 Windows Terminal 进程，查找标题包含项目路径或 "claude" 的窗口
+ * 2. 排除 VS Code 窗口（Code 进程）
+ * 3. 如果找到多个 Terminal 窗口，优先选择标题包含项目路径的
+ *
+ * @param text - 要发送的文本
+ * @param projectPath - 可选，项目路径用于精确匹配窗口
+ */
+async function sendToWindowsClipboard(text: string, projectPath?: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // 写入临时文件，使用 UTF-8 编码避免编码问题
+    const tempFile = join(DATA_DIR, `prompt-${Date.now()}-${randomBytes(8).toString('hex')}.txt`)
+
+    try {
+      writeFileSync(tempFile, text, 'utf8')
+    } catch (err) {
+      reject(new Error(`Failed to write temp file: ${err}`))
+      return
+    }
+
+    // 提取项目文件夹名称用于匹配
+    const projectName = projectPath ? projectPath.split(/[/\\]/).filter(Boolean).pop() || '' : ''
+
+    // PowerShell 脚本功能：
+    // 1. 从 UTF-8 文件读取文本
+    // 2. 设置剪贴板内容
+    // 3. 查找 Windows Terminal 窗口（排除 VS Code）
+    // 4. 优先匹配包含项目路径或 claude 的窗口
+    // 5. 发送 Ctrl+V 粘贴 + Enter 提交
+    const psScript = `
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+
+# 从临时文件读取文本 (UTF-8)
+$text = Get-Content -Path '${tempFile.replace(/\\/g, '\\\\')}' -Raw -Encoding UTF8
+if ($text) { $text = $text.TrimEnd() }
+
+# 设置剪贴板
+[System.Windows.Forms.Clipboard]::SetText($text)
+
+# 项目名称（用于精确匹配）
+$projectName = '${projectName}'
+
+# 查找所有 Windows Terminal 窗口（排除 VS Code）
+$terminalWindows = Get-Process | Where-Object {
+    $_.ProcessName -eq "WindowsTerminal" -and
+    $_.MainWindowHandle -ne 0 -and
+    $_.MainWindowTitle -ne ""
+}
+
+Write-Output "找到 $($terminalWindows.Count) 个 Windows Terminal 窗口"
+
+$targetWindow = $null
+
+# 策略 1：如果有项目名称，优先查找标题包含项目名称的窗口
+if ($projectName -and $terminalWindows.Count -gt 0) {
+    $match = $terminalWindows | Where-Object {
+        $_.MainWindowTitle -like "*$projectName*"
+    } | Select-Object -First 1
+    if ($match) {
+        $targetWindow = $match
+        Write-Output "匹配项目名称: $projectName"
+    }
+}
+
+# 策略 2：查找标题包含 "claude" 的 Terminal 窗口
+if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
+    $match = $terminalWindows | Where-Object {
+        $_.MainWindowTitle -like "*claude*"
+    } | Select-Object -First 1
+    if ($match) {
+        $targetWindow = $match
+        Write-Output "匹配 claude 关键字"
+    }
+}
+
+# 策略 3：使用任意 Windows Terminal 窗口
+if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
+    $targetWindow = $terminalWindows | Select-Object -First 1
+    Write-Output "使用第一个 Terminal 窗口"
+}
+
+# 策略 4：查找 PowerShell 独立窗口（非 VS Code）
+if (-not $targetWindow) {
+    $psWindows = Get-Process | Where-Object {
+        ($_.ProcessName -eq "powershell" -or $_.ProcessName -eq "pwsh") -and
+        $_.MainWindowHandle -ne 0 -and
+        $_.MainWindowTitle -ne "" -and
+        $_.MainWindowTitle -notlike "*Visual Studio Code*"
+    }
+    if ($psWindows.Count -gt 0) {
+        if ($projectName) {
+            $match = $psWindows | Where-Object { $_.MainWindowTitle -like "*$projectName*" } | Select-Object -First 1
+            if ($match) { $targetWindow = $match }
+        }
+        if (-not $targetWindow) {
+            $match = $psWindows | Where-Object { $_.MainWindowTitle -like "*claude*" } | Select-Object -First 1
+            if ($match) { $targetWindow = $match }
+        }
+        if (-not $targetWindow) {
+            $targetWindow = $psWindows | Select-Object -First 1
+        }
+        Write-Output "使用 PowerShell 窗口"
+    }
+}
+
+if ($targetWindow) {
+    Write-Output "目标窗口: $($targetWindow.ProcessName) - $($targetWindow.MainWindowTitle)"
+
+    # 激活窗口
+    $hwnd = $targetWindow.MainWindowHandle
+    Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class Win32 {
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    }
+"@
+    [Win32]::ShowWindow($hwnd, 9)  # SW_RESTORE
+    [Win32]::SetForegroundWindow($hwnd)
+
+    Start-Sleep -Milliseconds 300
+
+    # 粘贴剪贴板内容
+    [System.Windows.Forms.SendKeys]::SendWait('^v')
+    Start-Sleep -Milliseconds 150
+
+    # 发送 Enter 提交
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+
+    Write-Output "OK - 已发送到 Windows Terminal"
+} else {
+    Write-Error "未找到 Windows Terminal 窗口。请确保已打开 Windows Terminal 并在其中运行 Claude CLI。"
+    exit 1
+}
+`
+
+    // 运行 PowerShell 脚本
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', psScript],
+      { ...EXEC_OPTIONS, timeout: 10000 },
+      (error, stdout, stderr) => {
+        // 清理临时文件
+        try { unlinkSync(tempFile) } catch {}
+
+        if (error) {
+          log(`[Windows] PowerShell 错误: ${stderr || error.message}`)
+          reject(new Error(`PowerShell error: ${stderr || error.message}`))
+        } else {
+          log(`[Windows] 窗口查找结果: ${stdout.trim()}`)
+          resolve()
+        }
+      }
+    )
+  })
+}
+
+/**
+ * 激活 Windows Terminal 窗口（不发送任何文本）
+ * 用于自动唤醒功能 - 当用户选择一个 session 时激活对应的 Claude 窗口
+ *
+ * @param projectPath - 项目路径用于精确匹配窗口
+ */
+async function activateWindowsTerminal(projectPath?: string): Promise<{ success: boolean; windowTitle?: string; error?: string }> {
+  return new Promise((resolve) => {
+    const projectName = projectPath ? projectPath.split(/[/\\]/).filter(Boolean).pop() || '' : ''
+
+    const psScript = `
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$projectName = '${projectName}'
+
+# 查找所有 Windows Terminal 窗口
+$terminalWindows = Get-Process | Where-Object {
+    $_.ProcessName -eq "WindowsTerminal" -and
+    $_.MainWindowHandle -ne 0 -and
+    $_.MainWindowTitle -ne ""
+}
+
+$targetWindow = $null
+
+# 策略 1：查找标题包含项目名称的窗口
+if ($projectName -and $terminalWindows.Count -gt 0) {
+    $match = $terminalWindows | Where-Object { $_.MainWindowTitle -like "*$projectName*" } | Select-Object -First 1
+    if ($match) { $targetWindow = $match }
+}
+
+# 策略 2：查找标题包含 claude 的窗口
+if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
+    $match = $terminalWindows | Where-Object { $_.MainWindowTitle -like "*claude*" } | Select-Object -First 1
+    if ($match) { $targetWindow = $match }
+}
+
+# 策略 3：使用任意 Windows Terminal 窗口
+if (-not $targetWindow -and $terminalWindows.Count -gt 0) {
+    $targetWindow = $terminalWindows | Select-Object -First 1
+}
+
+if ($targetWindow) {
+    # 激活窗口
+    $hwnd = $targetWindow.MainWindowHandle
+    Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class Win32Activate {
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    }
+"@
+    [Win32Activate]::ShowWindow($hwnd, 9)  # SW_RESTORE
+    [Win32Activate]::SetForegroundWindow($hwnd)
+
+    Write-Output "ACTIVATED:$($targetWindow.MainWindowTitle)"
+} else {
+    Write-Output "NOT_FOUND"
+}
+`
+
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', psScript],
+      { ...EXEC_OPTIONS, timeout: 5000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          log(`[Windows] 激活窗口失败: ${stderr || error.message}`)
+          resolve({ success: false, error: stderr || error.message })
+        } else {
+          const output = stdout.trim()
+          if (output.startsWith('ACTIVATED:')) {
+            const windowTitle = output.substring('ACTIVATED:'.length)
+            log(`[Windows] 已激活窗口: ${windowTitle}`)
+            resolve({ success: true, windowTitle })
+          } else {
+            log(`[Windows] 未找到匹配窗口 (项目: ${projectName})`)
+            resolve({ success: false, error: '未找到匹配的 Windows Terminal 窗口' })
+          }
+        }
+      }
+    )
+  })
+}
+
+/**
  * Safely send text to a tmux session using load-buffer + paste-buffer.
  * Uses execFile with proper arguments to prevent shell injection.
+ * On Windows, uses clipboard + SendKeys instead.
+ *
+ * @param tmuxSession - tmux session 名称（Unix）或忽略（Windows）
+ * @param text - 要发送的文本
+ * @param projectPath - 可选，项目路径用于 Windows 精确匹配窗口
  */
-async function sendToTmuxSafe(tmuxSession: string, text: string): Promise<void> {
-  // Validate session name
+async function sendToTmuxSafe(tmuxSession: string, text: string, projectPath?: string): Promise<void> {
+  // On Windows, use clipboard + SendKeys approach
+  if (IS_WINDOWS) {
+    await sendToWindowsClipboard(text, projectPath)
+    return
+  }
+
+  // Validate session name (Unix only)
   validateTmuxSession(tmuxSession)
 
   // Create temp file with cryptographically secure random name
@@ -441,10 +719,143 @@ function pollTokens(tmuxSession: string): void {
   })
 }
 
+// ============================================================================
+// Cross-Platform Token Tracking
+// ============================================================================
+
 /**
- * Start polling for tokens
+ * Token tracking state for event-based estimation.
+ * Used on Windows (primary) and as fallback on Unix.
+ * More accurate than simple character counting - uses Claude's tokenization approximation.
+ */
+const tokenEstimates = new Map<string, {
+  input: number      // Tokens from user input
+  output: number     // Tokens from tool outputs
+  toolCalls: number  // Tokens from tool invocations
+  cumulative: number // Running total
+  lastUpdate: number // Timestamp of last update
+}>()
+
+/**
+ * Estimate tokens using Claude's approximate tokenization rules:
+ * - ~4 characters per token for English text
+ * - ~2-3 characters per token for code
+ * - JSON/structured data varies
+ */
+function estimateTokenCount(text: string): number {
+  if (!text) return 0
+
+  // Detect content type and adjust ratio
+  const isCode = /[{}\[\]();=<>]/.test(text) && text.includes('\n')
+  const isJson = text.trim().startsWith('{') || text.trim().startsWith('[')
+
+  let charsPerToken = 4 // Default for English text
+  if (isCode) charsPerToken = 3
+  if (isJson) charsPerToken = 3.5
+
+  return Math.ceil(text.length / charsPerToken)
+}
+
+/**
+ * Track tokens from event data.
+ * Works cross-platform - used on Windows and as supplement on Unix.
+ */
+function trackEventTokens(event: ClaudeEvent, sessionId: string): void {
+  let estimate = tokenEstimates.get(sessionId)
+  if (!estimate) {
+    estimate = { input: 0, output: 0, toolCalls: 0, cumulative: 0, lastUpdate: Date.now() }
+    tokenEstimates.set(sessionId, estimate)
+  }
+
+  let tokensAdded = 0
+
+  // Track input from user prompts
+  if (event.type === 'user_prompt_submit') {
+    const promptEvent = event as UserPromptSubmitEvent
+    if (promptEvent.prompt) {
+      const inputTokens = estimateTokenCount(promptEvent.prompt)
+      estimate.input += inputTokens
+      tokensAdded += inputTokens
+      debug(`[Tokens] +${inputTokens} from user prompt`)
+    }
+  }
+
+  // Track tool inputs (pre_tool_use)
+  if (event.type === 'pre_tool_use') {
+    const toolEvent = event as PreToolUseEvent
+    if (toolEvent.input) {
+      const inputStr = typeof toolEvent.input === 'string'
+        ? toolEvent.input
+        : JSON.stringify(toolEvent.input)
+      // Cap at 10K chars to avoid huge estimates from large inputs
+      const toolInputTokens = estimateTokenCount(inputStr.slice(0, 10000))
+      estimate.toolCalls += toolInputTokens
+      tokensAdded += toolInputTokens
+      debug(`[Tokens] +${toolInputTokens} from ${toolEvent.tool} input`)
+    }
+  }
+
+  // Track tool outputs (post_tool_use)
+  if (event.type === 'post_tool_use') {
+    const toolEvent = event as PostToolUseEvent
+    if (toolEvent.output) {
+      const outputStr = typeof toolEvent.output === 'string'
+        ? toolEvent.output
+        : JSON.stringify(toolEvent.output)
+      // Cap at 50K chars to avoid huge estimates from large file reads
+      const outputTokens = estimateTokenCount(outputStr.slice(0, 50000))
+      estimate.output += outputTokens
+      tokensAdded += outputTokens
+      debug(`[Tokens] +${outputTokens} from ${toolEvent.tool} output`)
+    }
+  }
+
+  if (tokensAdded > 0) {
+    estimate.cumulative += tokensAdded
+    estimate.lastUpdate = Date.now()
+
+    // Update managed session
+    const managedSession = findManagedSession(sessionId)
+    if (managedSession) {
+      const currentTokens = estimate.input + estimate.output + estimate.toolCalls
+      managedSession.tokens = {
+        current: currentTokens,
+        cumulative: estimate.cumulative,
+      }
+
+      // Broadcast token update
+      broadcast({
+        type: 'tokens',
+        payload: {
+          session: managedSession.tmuxSession,
+          current: currentTokens,
+          cumulative: estimate.cumulative,
+        },
+      } as ServerMessage)
+    }
+  }
+}
+
+/**
+ * Reset token tracking for a session
+ */
+function resetTokenTracking(claudeSessionId: string): void {
+  tokenEstimates.delete(claudeSessionId)
+  debug(`[Tokens] Reset tracking for session ${claudeSessionId}`)
+}
+
+/**
+ * Start polling for tokens (Unix tmux-based polling + event tracking)
  */
 function startTokenPolling(): void {
+  // Event-based token tracking is always active (cross-platform)
+  log(`Token tracking enabled`)
+
+  // On Windows, we rely entirely on event-based tracking
+  if (IS_WINDOWS) {
+    return
+  }
+
   // Poll every 2 seconds - poll all managed sessions
   setInterval(() => {
     for (const session of managedSessions.values()) {
@@ -690,6 +1101,13 @@ function pollPermissions(sessionId: string, tmuxSession: string): void {
  * Start polling for permission prompts
  */
 function startPermissionPolling(): void {
+  // On Windows, managed sessions use --dangerously-skip-permissions mode
+  // This is the recommended mode for development and automated use
+  if (IS_WINDOWS) {
+    log(`Permission handling: auto-approve mode (Windows)`)
+    return
+  }
+
   // Poll every 1 second (more frequent than tokens since permissions are time-sensitive)
   setInterval(() => {
     for (const session of managedSessions.values()) {
@@ -777,17 +1195,19 @@ function createSession(options: CreateSessionRequest = {}): Promise<ManagedSessi
       return
     }
 
-    // Build claude command with flags
+    // 构建 claude 命令参数
     const flags = options.flags || {}
     const claudeArgs: string[] = []
 
-    // Defaults: continue=true, skipPermissions=true, chrome=false
-    if (flags.continue !== false) {
+    // 注意：不默认添加 -c (continue) 参数
+    // 因为新项目目录可能没有之前的对话，会导致 "No conversation found to continue" 错误
+    // 只有明确指定 continue=true 时才添加 -c
+    if (flags.continue === true) {
       claudeArgs.push('-c')
     }
     if (flags.skipPermissions !== false) {
-      // --permission-mode=bypassPermissions skips the workspace trust dialog
-      // --dangerously-skip-permissions skips tool permission prompts
+      // --permission-mode=bypassPermissions 跳过工作区信任对话框
+      // --dangerously-skip-permissions 跳过工具权限提示
       claudeArgs.push('--permission-mode=bypassPermissions')
       claudeArgs.push('--dangerously-skip-permissions')
     }
@@ -797,47 +1217,128 @@ function createSession(options: CreateSessionRequest = {}): Promise<ManagedSessi
 
     const claudeCmd = claudeArgs.length > 0 ? `claude ${claudeArgs.join(' ')}` : 'claude'
 
-    // Spawn tmux session with claude using execFile to prevent shell injection
-    // Arguments are passed as array, not interpolated into a shell string
-    execFile('tmux', [
-      'new-session',
-      '-d',
-      '-s', tmuxSession,
-      '-c', cwd,
-      `PATH=${EXEC_PATH} ${claudeCmd}`
-    ], EXEC_OPTIONS, (error) => {
-      if (error) {
-        log(`Failed to spawn session: ${error.message}`)
-        reject(new Error(`Failed to spawn session: ${error.message}`))
-        return
+    // Platform-specific session spawning
+    if (IS_WINDOWS) {
+      // Windows 多窗口模式：为每个项目启动独立的 Claude 实例
+      // 使用 Windows Terminal (wt.exe) 启动 Claude CLI
+      log(`[Windows] 启动 Claude 在 Windows Terminal 中`)
+      log(`[Windows] 工作目录: ${cwd}`)
+      log(`[Windows] 命令: ${claudeCmd}`)
+
+      // 使用 PowerShell 启动 Windows Terminal 或 cmd
+      // 这样可以确保环境变量正确传递
+      const wtPath = join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WindowsApps', 'wt.exe')
+
+      // 检查 Windows Terminal 是否存在
+      const useWT = existsSync(wtPath)
+      log(`[Windows] Windows Terminal 路径: ${wtPath}, 存在: ${useWT}`)
+
+      if (useWT) {
+        // 使用 Windows Terminal
+        const wtArgs = ['-d', cwd, '--title', name, '--', 'cmd', '/k', claudeCmd]
+        execFile(wtPath, wtArgs, { ...EXEC_OPTIONS, cwd }, (error) => {
+          if (error) {
+            log(`[Windows] Windows Terminal 启动失败: ${error.message}`)
+            // 回退到 PowerShell 方式
+            launchWithPowerShell()
+            return
+          }
+          createWindowsSession()
+        })
+      } else {
+        // 没有 Windows Terminal，使用 PowerShell 启动
+        launchWithPowerShell()
       }
 
-      const session: ManagedSession = {
-        id,
-        name,
-        tmuxSession,
-        status: 'idle',
-        createdAt: Date.now(),
-        lastActivity: Date.now(),
-        cwd,
+      function launchWithPowerShell() {
+        // 使用 PowerShell 启动新窗口，确保环境变量正确
+        const psScript = `
+          $host.UI.RawUI.WindowTitle = '${name.replace(/'/g, "''")}'
+          Set-Location -Path '${cwd.replace(/'/g, "''")}'
+          & ${claudeCmd}
+        `
+        // Start-Process 会继承当前进程的环境变量
+        const psCmd = `Start-Process powershell -ArgumentList '-NoExit', '-Command', '${psScript.replace(/'/g, "''").replace(/\n/g, '; ')}'`
+
+        exec(`powershell -Command "${psCmd}"`, { ...EXEC_OPTIONS }, (psError) => {
+          if (psError) {
+            log(`[Windows] PowerShell 启动失败: ${psError.message}`)
+            reject(new Error(`无法启动 Claude: ${psError.message}`))
+            return
+          }
+          createWindowsSession()
+        })
       }
 
-      managedSessions.set(id, session)
-      log(`Created session: ${name} (${id.slice(0, 8)}) -> tmux:${tmuxSession} cmd:'${claudeCmd}'`)
+      function createWindowsSession() {
+        const session: ManagedSession = {
+          id,
+          name,
+          tmuxSession, // 保留兼容性
+          status: 'idle',
+          createdAt: Date.now(),
+          lastActivity: Date.now(),
+          cwd,
+        }
 
-      // Track git status for this session
-      if (cwd) {
-        gitStatusManager.track(id, cwd)
-        // Remember this directory for future autocomplete
-        projectsManager.addProject(cwd, name)
+        managedSessions.set(id, session)
+        log(`[Windows] 创建 session: ${name} (${id.slice(0, 8)}) -> 目录: "${cwd}"`)
+
+        // 跟踪此 session 的 git 状态
+        if (cwd) {
+          gitStatusManager.track(id, cwd)
+          projectsManager.addProject(cwd, name)
+        }
+
+        // 广播并持久化
+        broadcastSessions()
+        saveSessions()
+
+        resolve(session)
       }
+    } else {
+      // Unix: Spawn tmux session with claude using execFile to prevent shell injection
+      // Arguments are passed as array, not interpolated into a shell string
+      execFile('tmux', [
+        'new-session',
+        '-d',
+        '-s', tmuxSession,
+        '-c', cwd,
+        `PATH=${EXEC_PATH} ${claudeCmd}`
+      ], EXEC_OPTIONS, (error) => {
+        if (error) {
+          log(`Failed to spawn session: ${error.message}`)
+          reject(new Error(`Failed to spawn session: ${error.message}`))
+          return
+        }
 
-      // Broadcast and persist
-      broadcastSessions()
-      saveSessions()
+        const session: ManagedSession = {
+          id,
+          name,
+          tmuxSession,
+          status: 'idle',
+          createdAt: Date.now(),
+          lastActivity: Date.now(),
+          cwd,
+        }
 
-      resolve(session)
-    })
+        managedSessions.set(id, session)
+        log(`Created session: ${name} (${id.slice(0, 8)}) -> tmux:${tmuxSession} cmd:'${claudeCmd}'`)
+
+        // Track git status for this session
+        if (cwd) {
+          gitStatusManager.track(id, cwd)
+          // Remember this directory for future autocomplete
+          projectsManager.addProject(cwd, name)
+        }
+
+        // Broadcast and persist
+        broadcastSessions()
+        saveSessions()
+
+        resolve(session)
+      })
+    }
   })
 }
 
@@ -922,6 +1423,8 @@ function deleteSession(id: string): Promise<boolean> {
 
 /**
  * Send a prompt to a specific session
+ * Windows: 发送 prompt 到 Windows Terminal 中运行的 Claude CLI
+ * 优先匹配包含项目路径或 claude 关键字的窗口
  */
 async function sendPromptToSession(id: string, prompt: string): Promise<{ ok: boolean; error?: string }> {
   const session = managedSessions.get(id)
@@ -930,7 +1433,12 @@ async function sendPromptToSession(id: string, prompt: string): Promise<{ ok: bo
   }
 
   try {
-    await sendToTmuxSafe(session.tmuxSession, prompt)
+    if (IS_WINDOWS) {
+      log(`[Windows] 发送 prompt 到 Terminal (session: ${session.name}, cwd: ${session.cwd})`)
+    }
+
+    // 传递项目路径用于精确匹配 Windows Terminal 窗口
+    await sendToTmuxSafe(session.tmuxSession, prompt, session.cwd)
     session.lastActivity = Date.now()
     log(`Prompt sent to ${session.name}: ${prompt.slice(0, 50)}...`)
     return { ok: true }
@@ -945,6 +1453,11 @@ async function sendPromptToSession(id: string, prompt: string): Promise<{ ok: bo
  * Check if tmux sessions are still alive and update status
  */
 function checkSessionHealth(): void {
+  // Skip on Windows - tmux not available
+  if (IS_WINDOWS) {
+    return
+  }
+
   exec('tmux list-sessions -F "#{session_name}"', EXEC_OPTIONS, (error, stdout) => {
     if (error) {
       // tmux might not be running
@@ -1250,6 +1763,89 @@ function findManagedSession(claudeSessionId: string): ManagedSession | undefined
   return undefined
 }
 
+/**
+ * 根据 cwd（工作目录）查找 managed session
+ * 用于自动链接重启后的新 Claude session
+ */
+function findManagedSessionByCwd(cwd: string): ManagedSession | undefined {
+  if (!cwd) return undefined
+
+  // 规范化路径以便比较（处理 Windows/Unix 路径差异）
+  const normalizePath = (p: string) => p.toLowerCase().replace(/\\/g, '/')
+
+  const normalizedCwd = normalizePath(cwd)
+
+  for (const session of managedSessions.values()) {
+    if (normalizePath(session.cwd) === normalizedCwd) {
+      return session
+    }
+  }
+  return undefined
+}
+
+/**
+ * 尝试自动链接 Claude session 到 managed session
+ * 当收到事件但找不到对应的 managed session 时调用
+ *
+ * 场景：
+ * 1. VibeCraft 重启后，旧的 claudeSessionId 可能已无效
+ * 2. 用户在 Claude CLI 中继续对话，产生新的 session ID
+ * 3. 需要根据 cwd 重新建立链接
+ *
+ * 重要：如果 session 已有活跃链接且最近有活动，不要切换到另一个 Claude 实例
+ */
+function tryAutoLinkSession(claudeSessionId: string, cwd: string): ManagedSession | undefined {
+  // 首先检查是否已经链接
+  const existingSession = findManagedSession(claudeSessionId)
+  if (existingSession) {
+    return existingSession
+  }
+
+  // 根据 cwd 查找 managed session
+  const sessionByCwd = findManagedSessionByCwd(cwd)
+  if (sessionByCwd) {
+    const oldClaudeId = sessionByCwd.claudeSessionId
+
+    if (oldClaudeId === claudeSessionId) {
+      // 已经是同一个，直接返回
+      return sessionByCwd
+    }
+
+    // 如果已有链接，检查是否应该切换
+    if (oldClaudeId) {
+      const timeSinceLastActivity = Date.now() - sessionByCwd.lastActivity
+      const LINK_SWITCH_TIMEOUT_MS = 30000 // 30秒内有活动则不切换
+
+      // 如果最近有活动，说明旧链接仍然有效，不要切换
+      // 这防止了多个 Claude 窗口导致的链接不断切换
+      if (timeSinceLastActivity < LINK_SWITCH_TIMEOUT_MS && sessionByCwd.status !== 'offline') {
+        debug(`[Auto-link] 跳过切换：${sessionByCwd.name} 最近 ${Math.round(timeSinceLastActivity / 1000)}s 有活动`)
+        return undefined
+      }
+
+      // 旧链接已经不活跃，可以切换
+      claudeToManagedMap.delete(oldClaudeId)
+      debug(`[Auto-link] 清除旧链接: ${oldClaudeId.slice(0, 8)}`)
+    }
+
+    // 建立新链接
+    linkClaudeSession(claudeSessionId, sessionByCwd.id)
+    sessionByCwd.claudeSessionId = claudeSessionId
+
+    // 更新状态（因为收到了新事件）
+    if (sessionByCwd.status === 'offline') {
+      sessionByCwd.status = 'idle'
+    }
+
+    log(`[Auto-link] 自动链接 Claude session ${claudeSessionId.slice(0, 8)} 到 ${sessionByCwd.name}`)
+    broadcastSessions()
+    saveSessions()
+    return sessionByCwd
+  }
+
+  return undefined
+}
+
 // ============================================================================
 // Event Processing
 // ============================================================================
@@ -1299,8 +1895,18 @@ function addEvent(event: ClaudeEvent) {
     events.splice(0, events.length - MAX_EVENTS)
   }
 
+  // Track tokens from event data (cross-platform)
+  if (event.sessionId) {
+    trackEventTokens(event, event.sessionId)
+  }
+
   // Update managed session status based on event
-  const managedSession = findManagedSession(event.sessionId)
+  // 首先尝试常规查找，如果找不到则尝试自动链接
+  let managedSession = findManagedSession(event.sessionId)
+  if (!managedSession && event.sessionId && event.cwd) {
+    managedSession = tryAutoLinkSession(event.sessionId, event.cwd)
+  }
+
   if (managedSession) {
     const prevStatus = managedSession.status
     managedSession.lastActivity = Date.now() // Use current time for accurate timeout tracking
@@ -1862,6 +2468,33 @@ function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
       return
     }
 
+    // POST /sessions/:id/activate - 激活 session 对应的 Claude 窗口（Windows）
+    if (req.method === 'POST' && action === 'activate') {
+      const session = getSession(sessionId)
+      if (!session) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'Session not found' }))
+        return
+      }
+
+      if (IS_WINDOWS) {
+        // Windows: 激活对应的 Terminal 窗口
+        activateWindowsTerminal(session.cwd).then(result => {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            ok: result.success,
+            windowTitle: result.windowTitle,
+            error: result.error
+          }))
+        })
+      } else {
+        // Unix: tmux 窗口不需要特殊激活
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, message: 'Unix - tmux session already active' }))
+      }
+      return
+    }
+
     // POST /sessions/:id/cancel - Send Ctrl+C to specific session
     if (req.method === 'POST' && action === 'cancel') {
       const session = getSession(sessionId)
@@ -1932,15 +2565,6 @@ function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
         return
       }
 
-      // Validate inputs to prevent command injection
-      try {
-        validateTmuxSession(session.tmuxSession)
-      } catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: false, error: 'Invalid tmux session name' }))
-        return
-      }
-
       let cwd: string
       try {
         cwd = validateDirectoryPath(session.cwd || process.cwd())
@@ -1950,43 +2574,102 @@ function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
         return
       }
 
-      // Kill existing tmux session if it exists (ignore errors)
-      execFile('tmux', ['kill-session', '-t', session.tmuxSession], EXEC_OPTIONS, () => {
-        // Respawn tmux session with claude using execFile
-        execFile('tmux', [
-          'new-session',
-          '-d',
-          '-s', session.tmuxSession,
-          '-c', cwd,
-          `PATH=${EXEC_PATH} claude -c --permission-mode=bypassPermissions --dangerously-skip-permissions`
-        ], EXEC_OPTIONS, (error) => {
-          if (error) {
-            res.writeHead(500, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ ok: false, error: `Failed to restart: ${error.message}` }))
-            return
+      // Helper to update session state after restart
+      const onRestartSuccess = () => {
+        session.status = 'idle'
+        session.lastActivity = Date.now()
+        session.claudeSessionId = undefined // Will be re-linked when events come in
+        session.currentTool = undefined
+
+        // Clear old linking
+        for (const [claudeId, managedId] of claudeToManagedMap) {
+          if (managedId === session.id) {
+            claudeToManagedMap.delete(claudeId)
           }
+        }
 
-          // Update session state
-          session.status = 'idle'
-          session.lastActivity = Date.now()
-          session.claudeSessionId = undefined // Will be re-linked when events come in
-          session.currentTool = undefined
+        log(`Restarted session: ${session.name} (${session.id.slice(0, 8)})`)
+        broadcastSessions()
+        saveSessions()
 
-          // Clear old linking
-          for (const [claudeId, managedId] of claudeToManagedMap) {
-            if (managedId === session.id) {
-              claudeToManagedMap.delete(claudeId)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, session }))
+      }
+
+      if (IS_WINDOWS) {
+        // Windows 多窗口模式：为此 session 重新启动 Claude
+        log(`[Windows] 重启 session: ${session.name}`)
+        log(`[Windows] 工作目录: ${cwd}`)
+
+        // 注意：不使用 -c 参数，避免 "No conversation found to continue" 错误
+        const claudeCmd = 'claude --permission-mode=bypassPermissions --dangerously-skip-permissions'
+
+        // 检查 Windows Terminal 是否存在
+        const wtPath = join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WindowsApps', 'wt.exe')
+        const useWT = existsSync(wtPath)
+
+        if (useWT) {
+          const wtArgs = ['-d', cwd, '--title', session.name, '--', 'cmd', '/k', claudeCmd]
+          execFile(wtPath, wtArgs, { ...EXEC_OPTIONS, cwd }, (error) => {
+            if (error) {
+              log(`[Windows] Windows Terminal 启动失败: ${error.message}`)
+              launchWithPowerShell()
+              return
             }
-          }
+            onRestartSuccess()
+          })
+        } else {
+          launchWithPowerShell()
+        }
 
-          log(`Restarted session: ${session.name} (${session.id.slice(0, 8)})`)
-          broadcastSessions()
-          saveSessions()
+        function launchWithPowerShell() {
+          // 使用 PowerShell 启动新窗口，确保环境变量正确
+          const psScript = `
+            $host.UI.RawUI.WindowTitle = '${session.name.replace(/'/g, "''")}'
+            Set-Location -Path '${cwd.replace(/'/g, "''")}'
+            & ${claudeCmd}
+          `
+          const psCmd = `Start-Process powershell -ArgumentList '-NoExit', '-Command', '${psScript.replace(/'/g, "''").replace(/\n/g, '; ')}'`
 
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, session }))
+          exec(`powershell -Command "${psCmd}"`, { ...EXEC_OPTIONS }, (psError) => {
+            if (psError) {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ ok: false, error: `无法重启 Claude: ${psError.message}` }))
+              return
+            }
+            onRestartSuccess()
+          })
+        }
+      } else {
+        // Unix: Validate tmux session name
+        try {
+          validateTmuxSession(session.tmuxSession)
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'Invalid tmux session name' }))
+          return
+        }
+
+        // 终止现有 tmux session（忽略错误）
+        execFile('tmux', ['kill-session', '-t', session.tmuxSession], EXEC_OPTIONS, () => {
+          // 重新创建 tmux session 并启动 claude
+          // 注意：不使用 -c 参数，避免 "No conversation found to continue" 错误
+          execFile('tmux', [
+            'new-session',
+            '-d',
+            '-s', session.tmuxSession,
+            '-c', cwd,
+            `PATH=${EXEC_PATH} claude --permission-mode=bypassPermissions --dangerously-skip-permissions`
+          ], EXEC_OPTIONS, (error) => {
+            if (error) {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ ok: false, error: `Failed to restart: ${error.message}` }))
+              return
+            }
+            onRestartSuccess()
+          })
         })
-      })
+      }
       return
     }
 
@@ -2175,7 +2858,7 @@ function serveStaticFile(req: IncomingMessage, res: ServerResponse): void {
   const filePath = resolve(distDir, '.' + decodedPath)
 
   // Check for path traversal: resolved path must start with distDir
-  if (!filePath.startsWith(distDir + '/') && filePath !== distDir) {
+  if (!filePath.startsWith(distDir + sep) && filePath !== distDir) {
     res.writeHead(403)
     res.end('Forbidden')
     return

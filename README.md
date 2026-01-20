@@ -1,48 +1,84 @@
-# Vibecraft
+# Vibecraft for Windows
 
 ![Vibecraft Screenshot](public/og-image.png)
 
-Manage Claude Code in style!
+**A Windows-compatible fork of [Vibecraft](https://github.com/Nearcyan/vibecraft)** — visualize Claude Code's activity in real-time as a 3D workshop.
 
-**[Try it instantly at vibecraft.sh](https://vibecraft.sh)** — still connects to your local Claude Code instances!
+> This fork adds Windows support with Git Bash compatibility. All credit for the original project goes to [@Nearcyan](https://github.com/Nearcyan).
 
-**New:**
-- **Spatial Audio** — Claude behind you? Claude on your left? No claublem!
-- **Animations** — What's Claude up to? Watch him! ◕ ‿ ◕
+![Three.js](https://img.shields.io/badge/Three.js-black?logo=threedotjs) ![TypeScript](https://img.shields.io/badge/TypeScript-blue?logo=typescript&logoColor=white) ![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
 
-Vibecraft uses your own local Claude Code instances — no files or prompts are shared.
+## What's Different from Original?
 
-![Three.js](https://img.shields.io/badge/Three.js-black?logo=threedotjs) ![TypeScript](https://img.shields.io/badge/TypeScript-blue?logo=typescript&logoColor=white) ![npm](https://img.shields.io/npm/v/vibecraft)
+| Feature | Original | This Fork |
+|---------|----------|-----------|
+| **Platform** | macOS / Linux only | **Windows + macOS + Linux** |
+| **Shell** | Bash required | Git Bash on Windows |
+| **Hooks** | Unix paths | Windows path compatibility |
 
-## Requirements
+## Requirements (Windows)
 
-- **macOS or Linux** (Windows not supported - hooks require bash)
-- **Node.js** 18+
-- **jq** - for hook scripts (`brew install jq` / `apt install jq`)
-- **tmux** - for session management (`brew install tmux` / `apt install tmux`)
+- **Windows 10/11**
+- **Git Bash** (comes with [Git for Windows](https://git-scm.com/download/win))
+- **Node.js** 18+ ([Download](https://nodejs.org/))
+- **jq** - for hook scripts
+- **tmux** (optional, for browser control)
+
+### Installing jq on Windows
+
+```bash
+# Option 1: Using Chocolatey
+choco install jq
+
+# Option 2: Using Scoop
+scoop install jq
+
+# Option 3: Manual download
+# Download from https://jqlang.github.io/jq/download/
+# Add to PATH
+```
+
+### Installing tmux on Windows (Optional)
+
+tmux is only needed if you want to send prompts from the browser.
+
+```bash
+# Using MSYS2 (recommended)
+pacman -S tmux
+
+# Or use Git Bash's built-in terminal multiplexer
+```
 
 ## Quick Start
 
-```bash
-# 1. Install dependencies
-brew install jq tmux       # macOS
-# sudo apt install jq tmux  # Ubuntu/Debian
+### Option 1: From npm (Recommended)
 
-# 2. Configure hooks (one time)
+```bash
+# 1. Configure hooks (one time)
 npx vibecraft setup
 
-# 3. Start server
+# 2. Start server
 npx vibecraft
 ```
 
-Open http://localhost:4003 and use Claude Code normally. You'll see Claude move around the workshop as it uses tools.
+### Option 2: From Source
 
-**From source:**
 ```bash
-git clone https://github.com/nearcyan/vibecraft
-cd vibecraft && npm install && npm run dev
-# Opens on http://localhost:4002
+# Clone this repo
+git clone https://github.com/Arxchibobo/vibeCraft-matrix
+cd vibeCraft-matrix
+
+# Install dependencies
+npm install
+
+# Configure hooks
+npm run setup
+
+# Start development server
+npm run dev
 ```
+
+Open http://localhost:4003 (or http://localhost:4002 for dev) and use Claude Code normally. You'll see Claude move around the workshop as it uses tools.
 
 **To uninstall:** `npx vibecraft uninstall` (removes hooks, keeps your data)
 
@@ -51,11 +87,21 @@ cd vibecraft && npm install && npm run dev
 Run Claude in tmux to send prompts from browser:
 
 ```bash
+# In Git Bash or MSYS2
 tmux new -s claude
 claude
 ```
 
 Then use the input field in the visualization with "Send to tmux" checked.
+
+## Features
+
+- **Real-time visualization** - Watch Claude move between workstations as it uses tools
+- **Multi-session support** - Run multiple Claude instances with separate zones
+- **Sound effects** - Synthesized audio feedback for tools and events
+- **Draw mode** - Paint hex tiles with colors and 3D stacking (press `D`)
+- **Voice input** - Speak prompts with real-time transcription
+- **Subagent visualization** - Mini-Claudes spawn at portal for parallel tasks
 
 ## Stations
 
@@ -70,69 +116,43 @@ Then use the input field in the visualization with "Send to tmux" checked.
 | Portal | Task (subagents) | Glowing ring portal |
 | Taskboard | TodoWrite | Board with sticky notes |
 
-## Features
-
-- **Floating context labels** - See file paths and commands above active stations
-- **Thought bubbles** - Claude shows thinking animation while processing
-- **Response capture** - Claude's responses appear in the activity feed
-- **Subagent visualization** - Mini-Claudes spawn at portal for parallel tasks
-- **Cancel button** - Send Ctrl+C to interrupt Claude
-- **Split-screen layout** - 60% 3D scene (Workshop), 40% activity feed
-- **Voice input** - Speak prompts with real-time transcription (requires Deepgram API key)
-- **Attention system** - Zones pulse when sessions need input or finish
-- **Sound effects** - Synthesized audio feedback for tools and events ([docs/SOUND.md](docs/SOUND.md))
-- **Draw mode** - Paint hex tiles with colors, 3D stacking, and text labels (press `D`)
-- **Text labels** - Add multi-line labels to hex tiles with custom modal
-- **Zone context menus** - Right-click zones for Info (`I`) or quick Command (`C`) input
-- **Station panels** - Toggle with `P` to see recent tool history per workstation
-- **Context-aware animations** - Claude celebrates commits, shakes head on errors
-
-## Multi-clauding
-
-![Multi-clauding](public/multiclaude.png)
-
-Run multiple Claude instances and direct work to each:
-
-1. Click **"+ New"** (or `Alt+N`) to spawn a new session
-2. Configure name, directory, and flags (`-r`, `--chrome`, `--dangerously-skip-permissions`)
-3. Click a session or press `1-6` (or `Alt+1-6` in inputs) to select it
-4. Send prompts to whichever Claude you want
-
-Each session runs in its own tmux, with status tracking (idle/working/offline).
-
-See [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) for the full API and architecture.
-
 ## Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
 | `Tab` / `Esc` | Switch focus between Workshop and Feed |
-| `1-6` | Switch to session (extended: QWERTY, ASDFGH, ZXCVBN) |
-| `0` / `` ` `` | All sessions / overview |
+| `1-6` | Switch to session |
 | `Alt+N` | New session |
 | `Alt+R` | Toggle voice input |
 | `F` | Toggle follow mode |
 | `P` | Toggle station panels |
 | `D` | Toggle draw mode |
 
-**Draw mode:** `1-6` colors, `0` eraser, `Q/E` brush size, `R` 3D stack, `X` clear
+## Troubleshooting (Windows)
 
-## CLI Options
+### Hook not working
 
-```bash
-vibecraft [options]
+1. Make sure Git Bash is installed and in PATH
+2. Check that jq is accessible: `jq --version`
+3. Verify hooks are configured: `cat ~/.claude/settings.json`
 
-Options:
-  --port, -p <port>    WebSocket server port (default: 4003)
-  --help, -h           Show help
-  --version, -v        Show version
-```
+### Path issues
 
-See [docs/SETUP.md](docs/SETUP.md) for detailed setup guide.
-See [CLAUDE.md](CLAUDE.md) for technical documentation.
+The hook script uses `~/.vibecraft/data/` which expands correctly in Git Bash. If you see path errors, ensure you're running commands from Git Bash, not CMD or PowerShell.
 
-Website: https://vibecraft.sh
+### tmux not found
+
+If you don't need browser prompt control, tmux is optional. The visualization will still work without it.
+
+## Original Project
+
+This is a fork of the original **[Vibecraft](https://github.com/Nearcyan/vibecraft)** by [@Nearcyan](https://github.com/Nearcyan).
+
+- **Original repo:** https://github.com/Nearcyan/vibecraft
+- **Original website:** https://vibecraft.sh
+
+All core functionality and design credit goes to the original author. This fork only adds Windows compatibility.
 
 ## License
 
-MIT
+MIT (same as original)

@@ -45,6 +45,7 @@
   "dependencies": {
     "@deepgram/sdk": "^4.11.3",
     "chokidar": "^4.0.0",
+    "dotenv": "^16.6.1",
     "three": "^0.170.0",
     "tone": "^15.1.22",
     "ws": "^8.18.0"
