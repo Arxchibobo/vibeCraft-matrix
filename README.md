@@ -146,6 +146,14 @@ The hook script uses `~/.vibecraft/data/` which expands correctly in Git Bash. I
 
 If you don't need browser prompt control, tmux is optional. The visualization will still work without it.
 
+## Contributors
+
+### Current Maintainer
+- **[@Arxchibobo](https://github.com/Arxchibobo)** - Windows support, multi-project sessions, automatic window launching
+
+### Original Author
+- **[@Nearcyan](https://github.com/Nearcyan)** - Original Vibecraft project, all core functionality and 3D visualization
+
 ## Original Project
 
 This is a fork of the original **[Vibecraft](https://github.com/Nearcyan/vibecraft)** by [@Nearcyan](https://github.com/Nearcyan).
