@@ -1,7 +1,8 @@
 /**
  * Vibecraft Electron Main Process
  *
- * Simplified version to ensure app starts
+ * Fixed version - always use file:// protocol
+ * because dist is bundled in app.asar
  */
 
 const { app, BrowserWindow, shell } = require('electron')
@@ -9,7 +10,7 @@ const path = require('path')
 
 console.log('[Electron] Starting...')
 console.log('[Electron] __dirname:', __dirname)
-console.log('[Electron] process.env:', process.env)
+console.log('[Electron] app.isPackaged:', app.isPackaged)
 
 let mainWindow = null
 
@@ -17,13 +18,8 @@ let mainWindow = null
 // Path Configuration
 // =============================================================================
 
-const isDev = !app.isPackaged
-console.log('[Electron] isDev:', isDev)
-
-// Use development server or local file
-const clientPath = isDev
-  ? 'http://localhost:5173'  // Vite dev server
-  : `file://${path.join(__dirname, '../dist/index.html')}`
+// Since dist is bundled in app.asar, we always use file:// protocol
+const clientPath = `file://${path.join(__dirname, '../dist/index.html')}`
 
 console.log('[Electron] clientPath:', clientPath)
 
@@ -39,14 +35,14 @@ function createWindow() {
     height: 900,
     minWidth: 1024,
     minHeight: 768,
-    backgroundColor: '#0a0a0a',
+    backgroundColor: '#1a1a2e', // Dark background matching app theme
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.cjs'),
-      webSecurity: false,  // Allow loading local files
+      webSecurity: false, // Allow loading local files
     },
-    show: false,  // Don't show until ready
+    show: false, // Don't show until ready
     title: 'Vibecraft - Claude Code Visualization',
     icon: path.join(__dirname, '../assets/icon.png'),
   })
@@ -59,14 +55,13 @@ function createWindow() {
     })
     .catch(err => {
       console.error('[Electron] Failed to load URL:', err)
-      // Try fallback
-      if (!clientPath.startsWith('file://')) {
-        const fallbackPath = `file://${path.join(__dirname, '../dist/index.html')}`
-        console.log('[Electron] Trying fallback path:', fallbackPath)
-        mainWindow.loadURL(fallbackPath).catch(e => {
-          console.error('[Electron] Fallback also failed:', e)
-        })
-      }
+      // Try absolute path
+      const absPath = path.resolve(__dirname, '../dist/index.html')
+      const absUrl = `file://${absPath}`
+      console.log('[Electron] Trying absolute path:', absUrl)
+      mainWindow.loadURL(absUrl).catch(e => {
+        console.error('[Electron] Absolute path also failed:', e)
+      })
     })
 
   mainWindow.once('ready-to-show', () => {
@@ -74,10 +69,8 @@ function createWindow() {
     mainWindow.show()
   })
 
-  // Open DevTools in development
-  if (isDev) {
-    mainWindow.webContents.openDevTools()
-  }
+  // Open DevTools in production too for debugging
+  mainWindow.webContents.openDevTools()
 
   mainWindow.on('closed', () => {
     console.log('[Electron] Window closed')
