@@ -1,85 +1,39 @@
 /**
  * Vibecraft Electron Main Process
  *
- * This file handles the Electron main process:
- * - Creates the main window
- * - Loads the built web app
- * - Manages system tray (optional)
- * - Handles auto-updates (optional)
+ * Simplified version to ensure app starts
  */
 
 const { app, BrowserWindow, shell } = require('electron')
 const path = require('path')
-const { spawn } = require('child_process')
+
+console.log('[Electron] Starting...')
+console.log('[Electron] __dirname:', __dirname)
+console.log('[Electron] process.env:', process.env)
 
 let mainWindow = null
-let serverProcess = null
 
 // =============================================================================
 // Path Configuration
 // =============================================================================
 
-// Determine if we're in development or production
 const isDev = !app.isPackaged
+console.log('[Electron] isDev:', isDev)
 
-// Path to the built client files
+// Use development server or local file
 const clientPath = isDev
-  ? 'http://localhost:5173' // Vite dev server
+  ? 'http://localhost:5173'  // Vite dev server
   : `file://${path.join(__dirname, '../dist/index.html')}`
 
-// Path to the server entry point
-const serverEntry = isDev
-  ? path.join(__dirname, '../dist/server/server/index.js')
-  : path.join(__dirname, '../dist/server/server/index.js')
-
-// =============================================================================
-// Server Management
-// =============================================================================
-
-function startServer() {
-  if (serverProcess) {
-    console.log('[Electron] Server already running')
-    return
-  }
-
-  console.log('[Electron] Starting Vibecraft server...')
-
-  serverProcess = spawn('node', [serverEntry], {
-    cwd: path.join(__dirname, '..'),
-    env: {
-      ...process.env,
-      VIBECRAFT_PORT: '4003',
-      VIBECRAFT_CLIENT_PORT: isDev ? '5173' : '4003',
-    },
-    stdio: 'inherit',
-  })
-
-  serverProcess.on('error', (err) => {
-    console.error('[Electron] Failed to start server:', err.message)
-  })
-
-  serverProcess.on('close', (code) => {
-    console.log(`[Electron] Server exited with code ${code}`)
-    serverProcess = null
-  })
-
-  // Wait a bit for the server to start
-  return new Promise((resolve) => setTimeout(resolve, 1000))
-}
-
-function stopServer() {
-  if (serverProcess) {
-    console.log('[Electron] Stopping server...')
-    serverProcess.kill('SIGTERM')
-    serverProcess = null
-  }
-}
+console.log('[Electron] clientPath:', clientPath)
 
 // =============================================================================
 // Window Management
 // =============================================================================
 
 function createWindow() {
+  console.log('[Electron] Creating window...')
+  
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -90,12 +44,35 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.cjs'),
+      webSecurity: false,  // Allow loading local files
     },
+    show: false,  // Don't show until ready
     title: 'Vibecraft - Claude Code Visualization',
     icon: path.join(__dirname, '../assets/icon.png'),
   })
 
+  console.log('[Electron] Loading URL:', clientPath)
+  
   mainWindow.loadURL(clientPath)
+    .then(() => {
+      console.log('[Electron] Page loaded successfully')
+    })
+    .catch(err => {
+      console.error('[Electron] Failed to load URL:', err)
+      // Try fallback
+      if (!clientPath.startsWith('file://')) {
+        const fallbackPath = `file://${path.join(__dirname, '../dist/index.html')}`
+        console.log('[Electron] Trying fallback path:', fallbackPath)
+        mainWindow.loadURL(fallbackPath).catch(e => {
+          console.error('[Electron] Fallback also failed:', e)
+        })
+      }
+    })
+
+  mainWindow.once('ready-to-show', () => {
+    console.log('[Electron] Window ready to show')
+    mainWindow.show()
+  })
 
   // Open DevTools in development
   if (isDev) {
@@ -103,48 +80,59 @@ function createWindow() {
   }
 
   mainWindow.on('closed', () => {
+    console.log('[Electron] Window closed')
     mainWindow = null
   })
 
   // Handle external links
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    console.log('[Electron] External link blocked:', url)
     shell.openExternal(url)
     return { action: 'deny' }
   })
+  
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+    console.error('[Electron] did-fail-load:', errorCode, errorDescription, validatedURL)
+  })
+  
+  console.log('[Electron] Window created successfully')
 }
 
 // =============================================================================
 // App Lifecycle
 // =============================================================================
 
-app.whenReady().then(async () => {
-  // Start the backend server
-  await startServer()
-
-  // Create the main window
+app.whenReady().then(() => {
+  console.log('[Electron] App ready')
   createWindow()
+})
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow()
-    }
-  })
+app.on('activate', () => {
+  console.log('[Electron] App activated')
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow()
+  }
 })
 
 app.on('window-all-closed', () => {
+  console.log('[Electron] All windows closed')
   if (process.platform !== 'darwin') {
-    stopServer()
     app.quit()
   }
 })
 
 app.on('before-quit', () => {
-  stopServer()
+  console.log('[Electron] App about to quit')
 })
 
 // =============================================================================
-// IPC Handlers
+// Error Handling
 // =============================================================================
 
-// We can add IPC handlers here for future features
-// Example: Open external links, show notifications, etc.
+process.on('uncaughtException', (err) => {
+  console.error('[Electron] Uncaught Exception:', err)
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Electron] Unhandled Rejection at:', promise, 'reason:', reason)
+})

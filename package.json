@@ -4,6 +4,7 @@
   "description": "3D visualization of Claude Code as an interactive workshop",
   "author": "Arxchibobo",
   "license": "MIT",
+  "main": "electron/main.cjs",
   "repository": {
     "type": "git",
     "url": "https://github.com/Arxchibobo/vibeCraft-matrix"
