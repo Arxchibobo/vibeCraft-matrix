@@ -7,6 +7,9 @@ node_modules/
 # Build output
 dist/
 
+# Release builds
+release/
+
 # Data files (generated at runtime)
 data/
 
@@ -30,9 +33,12 @@ npm-debug.log*
 
 # TypeScript cache
 *.tsbuildinfo
+# PNG files - ignore most but keep needed ones
 *.png
 !public/og-image.png
 !public/multiclaude.png
+!assets/icon.png
+!assets/vibecraft.iconset/*.png
 bin/vibecraft
 scripts/test-*.sh
 todo.txt

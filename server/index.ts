@@ -1073,10 +1073,10 @@ function trackEventTokens(event: ClaudeEvent, sessionId: string): void {
   // Track tool inputs (pre_tool_use)
   if (event.type === 'pre_tool_use') {
     const toolEvent = event as PreToolUseEvent
-    if (toolEvent.input) {
-      const inputStr = typeof toolEvent.input === 'string'
-        ? toolEvent.input
-        : JSON.stringify(toolEvent.input)
+    if (toolEvent.toolInput) {
+      const inputStr = typeof toolEvent.toolInput === 'string'
+        ? toolEvent.toolInput
+        : JSON.stringify(toolEvent.toolInput)
       // Cap at 10K chars to avoid huge estimates from large inputs
       const toolInputTokens = estimateTokenCount(inputStr.slice(0, 10000))
       estimate.toolCalls += toolInputTokens
@@ -1088,10 +1088,10 @@ function trackEventTokens(event: ClaudeEvent, sessionId: string): void {
   // Track tool outputs (post_tool_use)
   if (event.type === 'post_tool_use') {
     const toolEvent = event as PostToolUseEvent
-    if (toolEvent.output) {
-      const outputStr = typeof toolEvent.output === 'string'
-        ? toolEvent.output
-        : JSON.stringify(toolEvent.output)
+    if (toolEvent.toolResponse) {
+      const outputStr = typeof toolEvent.toolResponse === 'string'
+        ? toolEvent.toolResponse
+        : JSON.stringify(toolEvent.toolResponse)
       // Cap at 50K chars to avoid huge estimates from large file reads
       const outputTokens = estimateTokenCount(outputStr.slice(0, 50000))
       estimate.output += outputTokens
@@ -2058,7 +2058,7 @@ function findManagedSessionByCwd(cwd: string): ManagedSession | undefined {
   const normalizedCwd = normalizePath(cwd)
 
   for (const session of managedSessions.values()) {
-    if (normalizePath(session.cwd) === normalizedCwd) {
+    if (session.cwd && normalizePath(session.cwd) === normalizedCwd) {
       return session
     }
   }
@@ -2905,6 +2905,13 @@ function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
         }
 
         function launchWithPowerShell() {
+          // 检查session是否存在（TypeScript安全检查）
+          if (!session) {
+            res.writeHead(404, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: 'Session not found' }))
+            return
+          }
+
           // 使用 PowerShell 启动新窗口，确保环境变量正确
           const psScript = `
             $host.UI.RawUI.WindowTitle = '${session.name.replace(/'/g, "''")}'
