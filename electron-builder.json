@@ -12,7 +12,7 @@
     "package.json"
   ],
   "extraMetadata": {
-    "main": "electron/main.js"
+    "main": "electron/main.cjs"
   },
   "mac": {
     "category": "public.app-category.developer-tools",
