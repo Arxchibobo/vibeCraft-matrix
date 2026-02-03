@@ -42,6 +42,11 @@ import { DEFAULTS } from '../shared/defaults.js'
 import { GitStatusManager } from './GitStatusManager.js'
 import { ProjectsManager } from './ProjectsManager.js'
 import { fileURLToPath } from 'url'
+import {
+  estimateTokenCount,
+  parseTokensFromOutput,
+  detectPermissionPrompt
+} from './utils.js'
 
 // ============================================================================
 // Version (read from package.json)
@@ -272,7 +277,8 @@ async function launchClaudeWindow(cwd: string, claudeArgs: string[]): Promise<{
     const claudeCmd = `claude ${allArgs.join(' ')}`
 
     // 安全转义路径和参数（PowerShell 单引号字符串中，单引号需要用两个单引号转义）
-    const escapedCwd = cwd.replace(/\\/g, '\\\\').replace(/'/g, "''")
+    // 注意：在 PowerShell 单引号字符串中，反斜杠不是转义字符，所以不需要重复转义反斜杠
+    const escapedCwd = cwd.replace(/'/g, "''")
     const escapedWindowTitle = windowTitle.replace(/'/g, "''")
     const escapedClaudeCmd = claudeCmd.replace(/'/g, "''")
     const escapedProjectName = projectName.replace(/'/g, "''")
@@ -527,7 +533,7 @@ async function sendToWindowsClipboard(text: string, projectPath?: string): Promi
 Add-Type -AssemblyName System.Windows.Forms
 
 # 从临时文件读取文本 (UTF-8)
-$text = Get-Content -Path '${tempFile.replace(/\\/g, '\\\\')}' -Raw -Encoding UTF8
+$text = Get-Content -Path '${tempFile.replace(/'/g, "''")}' -Raw -Encoding UTF8
 if ($text) { $text = $text.TrimEnd() }
 
 # 设置剪贴板
@@ -917,40 +923,6 @@ function debug(...args: unknown[]) {
 // ============================================================================
 
 /**
- * Parse token count from Claude Code output
- * Patterns:
- *   ↓ 879 tokens
- *   ↓ 1,234 tokens
- *   ↓ 12.5k tokens
- *   ↓ 12k tokens
- */
-function parseTokensFromOutput(output: string): number | null {
-  // Match patterns like: ↓ 879 tokens, ↓ 1,234 tokens, ↓ 12.5k tokens
-  const patterns = [
-    /↓\s*([0-9,]+)\s*tokens?/gi,           // ↓ 879 tokens, ↓ 1,234 tokens
-    /↓\s*([0-9.]+)k\s*tokens?/gi,          // ↓ 12.5k tokens, ↓ 12k tokens
-  ]
-
-  let maxTokens = 0
-
-  // Pattern 1: plain numbers (possibly with commas)
-  const plainMatches = output.matchAll(patterns[0])
-  for (const match of plainMatches) {
-    const num = parseInt(match[1].replace(/,/g, ''), 10)
-    if (num > maxTokens) maxTokens = num
-  }
-
-  // Pattern 2: k suffix (thousands)
-  const kMatches = output.matchAll(patterns[1])
-  for (const match of kMatches) {
-    const num = Math.round(parseFloat(match[1]) * 1000)
-    if (num > maxTokens) maxTokens = num
-  }
-
-  return maxTokens > 0 ? maxTokens : null
-}
-
-/**
  * Poll tmux output for token counts
  */
 function pollTokens(tmuxSession: string): void {
@@ -1025,26 +997,6 @@ const tokenEstimates = new Map<string, {
   cumulative: number // Running total
   lastUpdate: number // Timestamp of last update
 }>()
-
-/**
- * Estimate tokens using Claude's approximate tokenization rules:
- * - ~4 characters per token for English text
- * - ~2-3 characters per token for code
- * - JSON/structured data varies
- */
-function estimateTokenCount(text: string): number {
-  if (!text) return 0
-
-  // Detect content type and adjust ratio
-  const isCode = /[{}\[\]();=<>]/.test(text) && text.includes('\n')
-  const isJson = text.trim().startsWith('{') || text.trim().startsWith('[')
-
-  let charsPerToken = 4 // Default for English text
-  if (isCode) charsPerToken = 3
-  if (isJson) charsPerToken = 3.5
-
-  return Math.ceil(text.length / charsPerToken)
-}
 
 /**
  * Track tokens from event data.
@@ -1164,119 +1116,6 @@ function startTokenPolling(): void {
 // ============================================================================
 // Permission Prompt Detection
 // ============================================================================
-
-/**
- * Parse tmux output to detect Claude Code permission prompts.
- *
- * Claude Code prompts look like:
- *   ● Bash(rm /tmp/test.txt)
- *   ⎿  Running PreToolUse hook…
- *   ─────────────────────────────
- *   Bash command
- *
- *      rm /tmp/test.txt
- *
- *   Do you want to proceed?
- *   ❯ 1. Yes
- *     2. Yes, and always allow access to tmp/ from this project
- *     3. No
- *
- *   Esc to cancel · Tab to add additional instructions
- *
- * OR (plan mode):
- *   · Bash(prompt: run TypeScript compiler)
- *   Would you like to proceed?
- *
- *     1. Yes, and bypass permissions
- *   ❯ 2. Yes, and manually approve edits
- *     3. Type here to tell Claude what to change
- *
- *   ctrl-g to edit in Vim · ~/.claude/plans/...
- */
-function detectPermissionPrompt(output: string): { tool: string; context: string; options: PermissionOption[] } | null {
-  const lines = output.split('\n')
-
-  // Look for "Do you want to proceed?" OR "Would you like to proceed?" in recent output
-  let proceedLineIdx = -1
-  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 30); i--) {
-    if (/(Do you want|Would you like) to proceed\?/i.test(lines[i])) {
-      proceedLineIdx = i
-      break
-    }
-  }
-
-  if (proceedLineIdx === -1) return null
-
-  // CRITICAL: Verify this is a real Claude Code prompt by checking for the footer
-  // "Esc to cancel · Tab to add additional instructions" OR "ctrl-g to edit in Vim"
-  let hasFooter = false
-  let hasSelector = false
-  for (let i = proceedLineIdx + 1; i < Math.min(lines.length, proceedLineIdx + 15); i++) {
-    if (/Esc to cancel|ctrl-g to edit/i.test(lines[i])) {
-      hasFooter = true
-      break
-    }
-    // Also check for the ❯ selector arrow which indicates the interactive menu
-    if (/^\s*❯/.test(lines[i])) {
-      hasSelector = true
-    }
-  }
-
-  // Must have either the footer or the selector arrow to be a real prompt
-  if (!hasFooter && !hasSelector) {
-    debug('Skipping false positive: no "Esc to cancel"/"ctrl-g" footer or ❯ selector found')
-    return null
-  }
-
-  // Parse numbered options below the "Do you want to proceed?" line
-  const options: PermissionOption[] = []
-  for (let i = proceedLineIdx + 1; i < Math.min(lines.length, proceedLineIdx + 10); i++) {
-    const line = lines[i]
-
-    // Stop if we hit the footer
-    if (/Esc to cancel/i.test(line)) break
-
-    // Match options like "❯ 1. Yes" or "  2. Yes, and always..."
-    // The arrow (❯) indicates current selection, but we want all options
-    const optionMatch = line.match(/^\s*[❯>]?\s*(\d+)\.\s+(.+)$/)
-    if (optionMatch) {
-      options.push({
-        number: optionMatch[1],
-        label: optionMatch[2].trim()
-      })
-    }
-  }
-
-  // Need at least 2 options to be valid
-  if (options.length < 2) return null
-
-  // Find the tool name - look backwards for "● ToolName(...)" or "Bash command" header
-  let tool = 'Unknown'
-  for (let i = proceedLineIdx; i >= Math.max(0, proceedLineIdx - 20); i--) {
-    // Match tool header like "● Bash(rm /tmp/test.txt)" or "· Bash(prompt: ...)"
-    // ● = bullet, ◐ = half-filled circle, · = middle dot (plan mode)
-    const toolMatch = lines[i].match(/[●◐·]\s*(\w+)\s*\(/)
-    if (toolMatch) {
-      tool = toolMatch[1]
-      break
-    }
-    // Also match standalone tool type like "Bash command" or "Read file"
-    const cmdMatch = lines[i].match(/^\s*(Bash|Read|Write|Edit|Grep|Glob|Task|WebFetch|WebSearch)\s+\w+/i)
-    if (cmdMatch) {
-      tool = cmdMatch[1]
-      break
-    }
-  }
-
-  // Build context from the prompt area (between tool header and options)
-  const contextStart = Math.max(0, proceedLineIdx - 10)
-  const contextEnd = proceedLineIdx + 1 + options.length
-  const context = lines.slice(contextStart, contextEnd).join('\n').trim()
-
-  debug(`Detected permission prompt: tool=${tool}, options=${options.map(o => o.number + ':' + o.label).join(', ')}`)
-
-  return { tool, context, options }
-}
 
 /**
  * Detect the bypass permissions warning that appears on first use of --dangerously-skip-permissions.
@@ -2803,6 +2642,45 @@ function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
           res.end(JSON.stringify({ ok: true }))
         }
       })
+      return
+    }
+
+    // GET /sessions/:id/output - Get terminal/tmux output for specific session
+    if (req.method === 'GET' && action === 'output') {
+      const session = getSession(sessionId)
+      if (!session) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'Session not found' }))
+        return
+      }
+
+      if (IS_WINDOWS) {
+        // Windows: terminal output capture is difficult without PTY
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          ok: true,
+          output: `[Windows] Direct terminal output capture is not supported.\nPlease check the Claude window: "${session.windowTitle || 'Claude'}"`
+        }))
+      } else {
+        try {
+          validateTmuxSession(session.tmuxSession)
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'Invalid tmux session name', output: '' }))
+          return
+        }
+
+        // Capture last 100 lines from tmux pane
+        execFile('tmux', ['capture-pane', '-t', session.tmuxSession, '-p', '-S', '-100'], { ...EXEC_OPTIONS, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+          if (error) {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: error.message, output: '' }))
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, output: stdout }))
+        })
+      }
       return
     }
 

@@ -29,6 +29,7 @@ export interface Station {
   position: THREE.Vector3  // World position (updated when zone elevation changes)
   localPosition: THREE.Vector3  // Position relative to zone (for recalculating world pos)
   mesh: THREE.Group
+  ringMesh?: THREE.Mesh    // Cached ring mesh for pulses
   label: string
   contextSprite?: THREE.Sprite
 }
@@ -1933,17 +1934,11 @@ export class WorkshopScene {
     const station = zone.stations.get(stationType)
     if (!station || stationType === 'center') return
 
-    // Find the ring mesh in the station group (last child is typically the ring)
-    let ring: THREE.Mesh | undefined
-    station.mesh.traverse((child) => {
-      if (child instanceof THREE.Mesh && child.geometry instanceof THREE.RingGeometry) {
-        ring = child
-      }
-    })
-
+    // Use cached ring mesh for better performance
+    const ring = station.ringMesh
     if (!ring) return
 
-    const ringMat = (ring as THREE.Mesh).material as THREE.MeshBasicMaterial
+    const ringMat = ring.material as THREE.MeshBasicMaterial
     const baseOpacity = ringMat.opacity
 
     // Don't add another pulse if already pulsing
@@ -2217,6 +2212,7 @@ export class WorkshopScene {
       position: worldPos,
       localPosition: localPos,
       mesh: stationGroup,
+      ringMesh: ring,
       label: config.label,
     }
   }
@@ -2489,7 +2485,7 @@ export class WorkshopScene {
         const ringMat = zone.ring.material as THREE.MeshBasicMaterial
 
         // Ring pulse animation (color is controlled by setZoneStatus, this only animates opacity/scale)
-        if (zone.attentionReason) {
+        if (zone.attentionReason || zone.status === 'waiting') {
           zone.attentionTime += delta
 
           // Different intensity by type - questions/errors are urgent, finished is subtle
@@ -2497,6 +2493,13 @@ export class WorkshopScene {
             // Subtle, slow pulse for finished
             const pulse = Math.sin(zone.attentionTime * 2) * 0.5 + 0.5
             zone.ring.scale.setScalar(1 + pulse * 0.02)
+          } else if (zone.status === 'waiting') {
+            // "Waiting" pulse - yellow, medium speed
+            const pulse = Math.sin(zone.attentionTime * 3) * 0.5 + 0.5
+            zone.ring.scale.setScalar(1 + pulse * 0.05)
+            // Also pulse opacity slightly
+            const ringMat = zone.ring.material as THREE.MeshBasicMaterial
+            ringMat.opacity = 0.5 + pulse * 0.3
           } else {
             // More noticeable pulse for questions/errors
             const pulse = Math.sin(zone.attentionTime * 4) * 0.5 + 0.5

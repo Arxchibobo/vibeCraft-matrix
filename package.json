@@ -42,6 +42,7 @@
     "prepublishOnly": "npm run build",
     "deploy": "./scripts/deploy.sh",
     "release": "./scripts/release.sh",
+    "test": "tsx --test tests/**/*.test.ts",
     "electron": "electron .",
     "electron:dev": "electron . --dev",
     "electron:build": "npm run build && electron-builder",
