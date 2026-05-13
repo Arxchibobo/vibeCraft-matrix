@@ -54,9 +54,13 @@ export class Claude implements ICharacter {
   private leftArm: THREE.Group
   private rightArm: THREE.Group
   private antenna: THREE.Group
+  private antennaTip: THREE.Mesh
   private statusRing: THREE.Mesh
   private thoughtBubbles: THREE.Group
   private glowAccents: THREE.Group
+  private leftFoot: THREE.Mesh
+  private rightFoot: THREE.Mesh
+  private chestLight: THREE.Mesh
 
   // Behavior systems
   private idleBehaviorManager: IdleBehaviorManager
@@ -77,9 +81,13 @@ export class Claude implements ICharacter {
     this.leftArm = this.createArm(-1)
     this.rightArm = this.createArm(1)
     this.antenna = this.createAntenna()
+    this.antennaTip = this.antenna.getObjectByName('antennaTip') as THREE.Mesh
     this.statusRing = this.createStatusRing()
     this.thoughtBubbles = this.createThoughtBubbles()
     this.glowAccents = this.createGlowAccents()
+    this.leftFoot = this.body.getObjectByName('leftFoot') as THREE.Mesh
+    this.rightFoot = this.body.getObjectByName('rightFoot') as THREE.Mesh
+    this.chestLight = this.body.getObjectByName('chestLight') as THREE.Mesh
 
     this.mesh.add(this.head)
     this.mesh.add(this.body)
@@ -591,11 +599,9 @@ export class Claude implements ICharacter {
         this.rightArm.rotation.x = Math.sin(this.bobTime + Math.PI) * 0.4
 
         // Feet movement
-        const leftFoot = this.body.getObjectByName('leftFoot') as THREE.Mesh
-        const rightFoot = this.body.getObjectByName('rightFoot') as THREE.Mesh
-        if (leftFoot && rightFoot) {
-          leftFoot.position.y = -0.32 + Math.max(0, Math.sin(this.bobTime)) * 0.03
-          rightFoot.position.y = -0.32 + Math.max(0, Math.sin(this.bobTime + Math.PI)) * 0.03
+        if (this.leftFoot && this.rightFoot) {
+          this.leftFoot.position.y = -0.32 + Math.max(0, Math.sin(this.bobTime)) * 0.03
+          this.rightFoot.position.y = -0.32 + Math.max(0, Math.sin(this.bobTime + Math.PI)) * 0.03
         }
 
         // Antenna bounce
@@ -716,16 +722,14 @@ export class Claude implements ICharacter {
     })
 
     // Antenna tip glow pulse
-    const antennaTip = this.antenna.getObjectByName('antennaTip') as THREE.Mesh
-    if (antennaTip) {
-      const mat = antennaTip.material as THREE.MeshBasicMaterial
+    if (this.antennaTip) {
+      const mat = this.antennaTip.material as THREE.MeshBasicMaterial
       mat.opacity = 0.7 + Math.sin(Date.now() * 0.003) * 0.2
     }
 
     // Chest light pulse
-    const chestLight = this.body.getObjectByName('chestLight') as THREE.Mesh
-    if (chestLight) {
-      const mat = chestLight.material as THREE.MeshBasicMaterial
+    if (this.chestLight) {
+      const mat = this.chestLight.material as THREE.MeshBasicMaterial
       mat.opacity = 0.6 + Math.sin(Date.now() * 0.004) * 0.3
     }
   }
