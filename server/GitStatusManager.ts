@@ -27,11 +27,12 @@ export class GitStatusManager {
   private statusCache = new Map<string, GitStatus>()
   private directories = new Map<string, string>() // sessionId -> directory
   private pollInterval: NodeJS.Timeout | null = null
+  private isPolling = false
   private onUpdate: ((update: GitStatusUpdate) => void) | null = null
 
   // Configuration
   private readonly POLL_INTERVAL_MS = 5000 // Poll every 5 seconds
-  private readonly EXEC_TIMEOUT_MS = 5000  // Timeout for git commands
+  private readonly EXEC_TIMEOUT_MS = 10000 // Timeout for git commands
 
   constructor() {}
 
@@ -79,12 +80,15 @@ export class GitStatusManager {
   start(): void {
     if (this.pollInterval) return
 
-    this.pollInterval = setInterval(() => {
-      this.pollAll()
-    }, this.POLL_INTERVAL_MS)
+    const schedulePoll = () => {
+      this.pollInterval = setTimeout(async () => {
+        await this.pollAll()
+        schedulePoll()
+      }, this.POLL_INTERVAL_MS)
+    }
 
     // Initial poll
-    this.pollAll()
+    this.pollAll().then(() => schedulePoll())
   }
 
   /**
@@ -92,7 +96,7 @@ export class GitStatusManager {
    */
   stop(): void {
     if (this.pollInterval) {
-      clearInterval(this.pollInterval)
+      clearTimeout(this.pollInterval)
       this.pollInterval = null
     }
   }
@@ -110,10 +114,19 @@ export class GitStatusManager {
    * Poll all tracked directories
    */
   private async pollAll(): Promise<void> {
-    const promises = Array.from(this.directories.entries()).map(
-      ([sessionId, directory]) => this.fetchStatus(sessionId, directory)
-    )
-    await Promise.all(promises)
+    if (this.isPolling) return
+    this.isPolling = true
+
+    try {
+      const promises = Array.from(this.directories.entries()).map(
+        ([sessionId, directory]) => this.fetchStatus(sessionId, directory).catch(err => {
+          console.error(`[GitStatus] Error fetching status for ${sessionId}:`, err)
+        })
+      )
+      await Promise.all(promises)
+    } finally {
+      this.isPolling = false
+    }
   }
 
   /**

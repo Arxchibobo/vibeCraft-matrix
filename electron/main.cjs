@@ -7,12 +7,15 @@
 
 const { app, BrowserWindow, shell } = require('electron')
 const path = require('path')
+const { fork } = require('child_process')
+const http = require('http')
 
 console.log('[Electron] Starting...')
 console.log('[Electron] __dirname:', __dirname)
 console.log('[Electron] app.isPackaged:', app.isPackaged)
 
 let mainWindow = null
+let serverProcess = null
 
 // =============================================================================
 // Path Configuration
@@ -92,11 +95,63 @@ function createWindow() {
 }
 
 // =============================================================================
+// Server Management
+// =============================================================================
+
+function startServer() {
+  return new Promise((resolve) => {
+    // First, check if a server is already running on port 4003
+    const req = http.get('http://localhost:4003/health', { timeout: 1000 }, (res) => {
+      console.log('[Electron] Server already running on port 4003')
+      resolve(true)
+    })
+
+    req.on('error', () => {
+      // Server not running, start it
+      console.log('[Electron] Starting internal server...')
+
+      // Determine server path
+      // In dev: server/index.ts (but we need compiled JS or tsx)
+      // In prod: dist/server/server/index.js
+      const serverPath = app.isPackaged
+        ? path.join(__dirname, '../dist/server/server/index.js')
+        : path.join(__dirname, '../server/index.ts')
+
+      if (!app.isPackaged) {
+        // Use npx tsx in dev
+        console.log('[Electron] Running server with npx tsx in dev mode')
+        serverProcess = fork(serverPath, [], {
+          execArgv: ['--import', 'tsx'],
+          env: { ...process.env, VIBECRAFT_PORT: 4003 }
+        })
+      } else {
+        // Run with node in prod
+        serverProcess = fork(serverPath, [], {
+          env: { ...process.env, VIBECRAFT_PORT: 4003 }
+        })
+      }
+
+      serverProcess.on('message', (msg) => {
+        console.log('[Server]', msg)
+      })
+
+      serverProcess.on('error', (err) => {
+        console.error('[Electron] Server process error:', err)
+      })
+
+      // Give it a moment to start
+      setTimeout(() => resolve(true), 2000)
+    })
+  })
+}
+
+// =============================================================================
 // App Lifecycle
 // =============================================================================
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   console.log('[Electron] App ready')
+  await startServer()
   createWindow()
 })
 
@@ -116,6 +171,10 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   console.log('[Electron] App about to quit')
+  if (serverProcess) {
+    console.log('[Electron] Killing server process...')
+    serverProcess.kill()
+  }
 })
 
 // =============================================================================

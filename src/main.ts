@@ -382,11 +382,14 @@ async function createManagedSession(
 
   if (!data.ok) {
     console.error('Failed to create session:', data.error)
-    // Show offline banner if not connected, otherwise show alert
+    // Show offline banner if not connected, otherwise show toast error
     if (!state.client?.isConnected) {
       showOfflineBanner()
     } else {
-      alert(`Failed to create session: ${data.error}`)
+      toast.error(`Failed to create session: ${data.error}`, {
+        duration: 5000,
+        icon: '❌'
+      })
     }
     // Clean up pending zone on failure
     if (pendingZoneId && state.scene) {
@@ -588,7 +591,7 @@ function setupManagedSessions(): void {
 
   // Setup directory autocomplete
   if (cwdInput) {
-    setupDirectoryAutocomplete(cwdInput)
+    setupDirectoryAutocomplete(cwdInput, API_URL)
   }
 
   // Auto-populate name from directory when cwd changes
@@ -2181,6 +2184,8 @@ function setupPromptForm() {
 const TMUX_URL = `${API_URL}/tmux-output`
 
 let terminalPollInterval: number | null = null
+let lastTerminalOutput = ''
+let lastTerminalUrl = ''
 
 function setupTerminalToggle() {
   const toggle = document.getElementById('terminal-toggle')
@@ -2194,6 +2199,9 @@ function setupTerminalToggle() {
     toggle.classList.toggle('active', !isHidden)
 
     if (!isHidden) {
+      // Reset state when opening
+      lastTerminalOutput = ''
+      lastTerminalUrl = ''
       // Start polling when visible
       fetchTerminalOutput()
       terminalPollInterval = window.setInterval(fetchTerminalOutput, 2000)
@@ -2209,21 +2217,40 @@ function setupTerminalToggle() {
   async function fetchTerminalOutput() {
     if (!output || !panel) return
     try {
-      const response = await fetch(TMUX_URL)
+      // Use selected session output if available, otherwise fallback to default
+      const url = state.selectedManagedSession
+        ? `${API_URL}/sessions/${state.selectedManagedSession}/output`
+        : TMUX_URL
+
+      const response = await fetch(url)
       const data = await response.json()
-      if (data.ok && data.output) {
+
+      // Only update if output or URL changed
+      if (data.ok && data.output !== undefined) {
+        if (data.output === lastTerminalOutput && url === lastTerminalUrl) return
+
+        lastTerminalOutput = data.output
+        lastTerminalUrl = url
+
         // Strip ANSI codes and clean up
         const cleaned = data.output
           .replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '') // Remove ANSI codes
           .replace(/\r/g, '') // Remove carriage returns
+
         output.textContent = cleaned
+
         // Auto-scroll to bottom
         panel.scrollTop = panel.scrollHeight
       } else if (data.error) {
+        if (data.error === lastTerminalOutput) return
+        lastTerminalOutput = data.error
         output.textContent = `Error: ${data.error}`
       }
     } catch (e) {
-      output.textContent = 'Failed to connect to server'
+      const errorMsg = 'Failed to connect to server'
+      if (errorMsg === lastTerminalOutput) return
+      lastTerminalOutput = errorMsg
+      output.textContent = errorMsg
     }
   }
 }

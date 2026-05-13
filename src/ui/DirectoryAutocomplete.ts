@@ -5,11 +5,6 @@
  * and shows a dropdown with keyboard navigation.
  */
 
-// Injected by Vite at build time
-declare const __VIBECRAFT_DEFAULT_PORT__: number
-const API_PORT = __VIBECRAFT_DEFAULT_PORT__
-const API_URL = `http://localhost:${API_PORT}`
-
 interface AutocompleteResult {
   path: string
   isKnown: boolean  // true if from known projects
@@ -20,6 +15,7 @@ interface AutocompleteResult {
  */
 export function setupDirectoryAutocomplete(
   input: HTMLInputElement,
+  apiUrl: string,
   onSelect?: (path: string) => void
 ): () => void {
   let dropdown: HTMLElement | null = null
@@ -137,7 +133,7 @@ export function setupDirectoryAutocomplete(
 
   const fetchResults = async (query: string) => {
     try {
-      const response = await fetch(`${API_URL}/projects/autocomplete?q=${encodeURIComponent(query)}`)
+      const response = await fetch(`${apiUrl}/projects/autocomplete?q=${encodeURIComponent(query)}`)
       const data = await response.json()
       if (data.ok && Array.isArray(data.results)) {
         results = data.results
